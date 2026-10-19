@@ -23,6 +23,9 @@ const ENDPOINT: &str = "https://chatgpt.com/backend-api/transcribe";
 pub const MODEL: &str = "gpt-transcribe";
 /// The service's upload cap is 20 MB; longer recordings go up in speech-island clips.
 const MAX_UPLOAD_BYTES: u64 = 19 * 1024 * 1024;
+/// The longest clip sent in one request. Clips go up as 16 kHz 16-bit mono (32 bytes per ms), so
+/// five minutes plus padding is about 10 MB, well under the cap.
+const MAX_CLIP_MS: u64 = 5 * 60_000;
 /// Below this share of cloud words found in whisper's words, the alignment isn't trusted.
 const MIN_ALIGNED: f64 = 0.6;
 
@@ -183,19 +186,28 @@ pub fn start(wav: &Path) -> Result<Pending> {
             if bytes.len() as u64 <= MAX_UPLOAD_BYTES {
                 return request(&auth, &wav).map(|text| (text, started.elapsed().as_millis()));
             }
-            let mut clips = crate::hex::plan_clips(&islands, duration_ms);
-            if clips.is_empty() {
-                clips.push((0, duration_ms));
-            }
+            let clips = bounded_clips(crate::hex::plan_clips(&islands, duration_ms), duration_ms);
+            crate::capture::scrawl_log(format!(
+                "chatgpt: {} MB is over the upload cap; sending {} clips, the longest {} s",
+                bytes.len() >> 20,
+                clips.len(),
+                clips.iter().map(|(a, b)| b - a).max().unwrap_or(0) / 1_000
+            ));
             let dir = crate::linux::gsr::runtime_dir();
             std::fs::create_dir_all(&dir)?;
             let clip_path = dir.join(format!("chatgpt-clip-{}.wav", std::process::id()));
+            // Each clip's own answer, in order, to stitch the cut seams (Hex's join can't know them).
+            let mut texts = Vec::new();
             let result = crate::hex::transcribe_clips(&samples, &clips, MODEL, |clip| {
                 std::fs::write(&clip_path, clip).map_err(|e| crate::hex::Failure::Unavailable(e.to_string()))?;
-                request(&auth, &clip_path).map_err(|e| crate::hex::Failure::Unavailable(format!("{e:#}")))
+                let text = request(&auth, &clip_path).map_err(|e| crate::hex::Failure::Unavailable(format!("{e:#}")))?;
+                texts.push(text.clone());
+                Ok(text)
             });
             let _ = std::fs::remove_file(&clip_path);
-            Ok((result?.text, started.elapsed().as_millis()))
+            let joined = result?.text;
+            let text = if texts.len() == clips.len() { stitch(&clips, &texts) } else { joined };
+            Ok((text, started.elapsed().as_millis()))
         })
     };
     Ok(Pending {
@@ -281,6 +293,51 @@ impl Pending {
         ));
         Ok(transcript)
     }
+}
+
+/// Clips small enough to upload: Hex's plan (or the whole recording when it found no speech),
+/// with anything longer than `MAX_CLIP_MS` cut into equal parts.
+fn bounded_clips(planned: Vec<(u64, u64)>, duration_ms: u64) -> Vec<(u64, u64)> {
+    let planned = if planned.is_empty() { vec![(0, duration_ms)] } else { planned };
+    let mut clips = Vec::new();
+    for (start, end) in planned {
+        let parts = (end.saturating_sub(start)).div_ceil(MAX_CLIP_MS).max(1);
+        let step = (end - start).div_ceil(parts);
+        let mut from = start;
+        while from < end {
+            let to = (from + step).min(end);
+            clips.push((from, to));
+            from = to;
+        }
+    }
+    clips
+}
+
+/// At most this many words are taken as heard twice across a cut (the 400 ms both clips share).
+const SEAM_WORDS: usize = 3;
+
+/// Joins the clips' answers. Where `bounded_clips` cut through speech (the clips touch), both
+/// requests heard the padding around the cut, so words that end one answer and start the next
+/// are kept once.
+fn stitch(clips: &[(u64, u64)], texts: &[String]) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    // How many of `words` came from the previous answer: only those can have been heard twice.
+    let mut previous = 0;
+    for (i, text) in texts.iter().enumerate() {
+        let mut next: Vec<&str> = text.split_whitespace().collect();
+        let fresh = next.len();
+        if i > 0 && clips[i - 1].1 == clips[i].0 {
+            let most = SEAM_WORDS.min(next.len()).min(previous);
+            let repeated = (1..=most)
+                .rev()
+                .find(|&k| words[words.len() - k..].iter().map(|w| norm(w)).eq(next[..k].iter().map(|w| norm(w))))
+                .unwrap_or(0);
+            next.drain(..repeated);
+        }
+        previous = fresh;
+        words.extend(next);
+    }
+    words.join(" ")
 }
 
 fn norm(word: &str) -> String {
@@ -411,6 +468,45 @@ pub fn segments_of(words: &[WordTiming]) -> Vec<TranscriptSegment> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cut_seams_keep_a_twice_heard_word_once() {
+        let texts = ["now press Save.".to_string(), "save and continue".to_string(), "Save again".to_string()];
+        // A cut between the first two; a real gap before the third.
+        let clips = [(0, 300_000), (300_000, 400_000), (500_000, 501_000)];
+        assert_eq!(stitch(&clips, &texts), "now press Save. and continue Save again");
+        // Nothing repeated at the cut: nothing dropped.
+        let texts = ["one two".to_string(), "three four".to_string()];
+        assert_eq!(stitch(&clips[..2], &texts), "one two three four");
+        // Only the answer just before a cut can repeat across it, never an earlier clip's words.
+        let clips = [(0, 1_000), (10_000, 310_000), (310_000, 610_000)];
+        let texts = ["Save.".to_string(), String::new(), "Save and continue".to_string()];
+        assert_eq!(stitch(&clips, &texts), "Save. Save and continue");
+        let texts = ["press Save".to_string(), "ok".to_string(), "press Save now".to_string()];
+        assert_eq!(stitch(&clips, &texts), "press Save ok press Save now");
+    }
+
+    #[test]
+    fn long_clips_are_split_under_the_upload_cap() {
+        let hour = 60 * 60_000;
+        // No speech found: the whole recording, in parts.
+        let whole = bounded_clips(Vec::new(), hour);
+        assert_eq!(whole.len(), 12);
+        // One long island next to a short one.
+        let clips = bounded_clips(vec![(1_000, 2_000), (10_000, 10_000 + 11 * 60_000)], hour);
+        assert_eq!(clips[0], (1_000, 2_000));
+        assert_eq!(clips.len(), 4);
+        for clips in [&whole, &clips] {
+            for &(a, b) in clips.iter() {
+                assert!(b > a && b - a <= MAX_CLIP_MS);
+                // Encoded with the padding on both sides, as hex::transcribe_clips sends it.
+                assert!(44 + (b - a + 400) * 32 <= MAX_UPLOAD_BYTES);
+            }
+        }
+        assert_eq!(clips.last().unwrap().1, 10_000 + 11 * 60_000);
+        assert!(clips.windows(2).skip(1).all(|w| w[0].1 == w[1].0), "the long island is cut without gaps");
+        assert_eq!(bounded_clips(vec![(0, 5_000)], 5_000), vec![(0, 5_000)]);
+    }
+
     use super::*;
 
     fn w(t0: u64, t1: u64, text: &str) -> WordTiming {
