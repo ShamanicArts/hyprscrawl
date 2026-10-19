@@ -517,6 +517,8 @@ fn open(cx: &mut App, dir: PathBuf, bundle: ScrawlBundle) {
             ..Default::default()
         },
         move |window, cx| {
+            // The titlebar option doesn't reach Wayland's xdg_toplevel title; set it directly.
+            window.set_window_title("Scrawl");
             let focus = cx.focus_handle();
             window.focus(&focus);
             cx.new(|_| ReviewWindow::new(dir, bundle, focus))

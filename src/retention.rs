@@ -338,6 +338,9 @@ fn shrinkable(dir: &Path, manifest: &Manifest) -> Option<PathBuf> {
 pub type Trasher<'a> = &'a dyn Fn(&Path) -> Result<()>;
 
 pub fn trash(path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let output = Command::new("gio").arg("trash").arg(path).output().context("Could not run gio trash")?;
+    #[cfg(not(target_os = "linux"))]
     let output = Command::new("/usr/bin/trash")
         .arg(path)
         .output()

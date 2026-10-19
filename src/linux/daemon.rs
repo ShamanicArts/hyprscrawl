@@ -59,7 +59,17 @@ fn parse_spec(spec: &str) -> (u64, String) {
 }
 
 /// Adds the record shortcut as a runtime bind unless something else already owns that chord.
+/// The review window floats like upstream's panel instead of being tiled. A runtime rule, like the
+/// shortcut: nothing is written to the user's config, and a reload drops it until it is added back.
+fn register_window_rule() {
+    let lua = r#"if scrawl_review_rule == nil then scrawl_review_rule = hl.window_rule({ name = "scrawl-review", match = { class = "dev.scrawl.Scrawl" }, float = true, center = true, size = "1120 740" }) end"#;
+    if let Err(e) = hypr::eval(lua) {
+        scrawl_log(format!("could not add the review window rule: {e:#}"));
+    }
+}
+
 pub fn register_hotkey() {
+    register_window_rule();
     let Some(spec) = hotkey() else { return };
     let (mask, key) = parse_spec(&spec);
     if let Ok(binds) = hypr::json::<Vec<serde_json::Value>>("binds") {
@@ -399,6 +409,8 @@ pub fn run(record_now: bool) -> Result<()> {
         last_bundle: Mutex::new(None),
     });
     register_hotkey();
+    // Upstream's cleanup: heavy media to the Trash after `mediaDays`, bundles after `bundleDays`.
+    crate::retention::start();
     scrawl_log(format!("scrawl daemon {} pid {}", env!("CARGO_PKG_VERSION"), std::process::id()));
 
     // Re-add the shortcut after `hyprctl reload`; notice a recording stopped from outside

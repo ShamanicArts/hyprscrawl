@@ -34,6 +34,7 @@ metal = "0.29.0"
 screencapturekit = { version = "=11.0.0", features = ["macos_15_0"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["wayland", "font-kit"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
