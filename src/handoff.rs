@@ -184,11 +184,17 @@ pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn copy_bundle_to_clipboard(_bundle_dir: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::linux::desktop::copy_bundle(_bundle_dir);
+    #[cfg(not(target_os = "linux"))]
     bail!("Image and text clipboard handoff requires macOS")
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn paste_bundle_image_and_text(_bundle_dir: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::linux::desktop::paste_bundle(_bundle_dir);
+    #[cfg(not(target_os = "linux"))]
     bail!("Image and text paste handoff requires macOS")
 }
 

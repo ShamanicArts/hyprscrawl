@@ -627,6 +627,7 @@ static WORKER: std::sync::OnceLock<flume::Sender<Job>> = std::sync::OnceLock::ne
 
 fn lower_priority() {
     // SAFETY: only changes the calling thread's scheduling class.
+    #[cfg(target_os = "macos")]
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
     }

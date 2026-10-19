@@ -288,6 +288,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn app_meta_of(pid: i32) -> AppMeta {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
     match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
@@ -305,6 +306,7 @@ fn app_meta_of(pid: i32) -> AppMeta {
 /// The strip the Dock reserves on the display at `frame` (global top-left points), from the
 /// difference between the screen's frame and visible frame. `None` when the Dock hides or off
 /// the main thread (`NSScreen` is main-thread only).
+#[cfg(target_os = "macos")]
 pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
@@ -465,6 +467,9 @@ fn run(
         thread::park_timeout(TICK);
     }
 }
+
+#[cfg(target_os = "linux")]
+include!("linux/windows_sys.rs");
 
 #[cfg(test)]
 mod tests {

@@ -1,16 +1,23 @@
+#![cfg_attr(target_os = "linux", allow(dead_code))]
 mod audio;
 mod autocrop;
 mod autocrop_lab;
+#[cfg_attr(target_os = "linux", path = "linux/capture.rs")]
 mod capture;
 mod delivery;
 mod export;
 mod handoff;
+#[cfg_attr(target_os = "linux", path = "linux/helper.rs")]
 mod helper;
 mod hex;
 mod hold;
+#[cfg_attr(target_os = "linux", path = "linux/icons.rs")]
 mod icons;
 mod inbox;
 mod keyframes;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg_attr(target_os = "linux", path = "linux/laser_overlay.rs")]
 mod laser_overlay;
 mod model;
 mod onboarding;
@@ -18,10 +25,13 @@ mod phone;
 mod render;
 mod retention;
 mod routing;
+#[cfg_attr(target_os = "linux", path = "linux/settings.rs")]
 mod settings;
 mod sketch;
+#[cfg_attr(target_os = "linux", path = "linux/sparkle.rs")]
 mod sparkle;
 mod transcribe;
+#[cfg_attr(target_os = "linux", path = "linux/ui.rs")]
 mod ui;
 mod web;
 mod windows;
@@ -1328,6 +1338,10 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = linux::cli::intercept() {
+        return result;
+    }
     if std::env::var_os("SCRAWL_BENCH_START").is_some() {
         ui::run_start_benchmark();
         return Ok(());
