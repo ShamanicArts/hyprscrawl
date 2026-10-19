@@ -21,6 +21,7 @@ const USAGE: &str = "Linux commands:
                               a plain screen recording (for demos), into ~/Videos/hyprscrawl
   scrawl doctor               check what this machine has
   scrawl hyprland-snippet     print persistent binds for ~/.config/hypr/bindings.lua
+  scrawl setup service        run the daemon as a systemd user service (starts with your session)
   scrawl setup launcher       add “Scrawl” entries (record, review latest) to the app launcher
   scrawl setup transcription  download a whisper model (asks first)
   scrawl setup transcription chatgpt|local
@@ -61,6 +62,7 @@ pub fn intercept() -> Option<Result<()>> {
             Ok(())
         }
         "setup" if args.get(1).map(String::as_str) == Some("launcher") => setup_launcher(),
+        "setup" if args.get(1).map(String::as_str) == Some("service") => setup_service(),
         "setup" if args.get(1).map(String::as_str) == Some("transcription") => match args.get(2).map(String::as_str) {
             Some("chatgpt") => setup_chatgpt(true),
             Some("local") => setup_chatgpt(false),
@@ -160,6 +162,47 @@ fn doctor() -> Result<()> {
     if bad > 0 {
         bail!("{bad} problem(s)");
     }
+    Ok(())
+}
+
+/// A systemd user service for the daemon, tied to the graphical session like Omarchy's own: uwsm
+/// hands each Hyprland session's variables to the user manager, so none are written here.
+fn setup_service() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = dirs::config_dir().context("no config dir")?.join("systemd/user");
+    std::fs::create_dir_all(&dir)?;
+    let unit = dir.join("scrawl.service");
+    std::fs::write(
+        &unit,
+        format!(
+            "[Unit]\n\
+             Description=Scrawl (Hyprscrawl) capture daemon: Alt+Shift+S record, Alt+Shift+R review, Alt+Shift+V paste\n\
+             After=graphical-session.target\n\
+             PartOf=graphical-session.target\n\
+             ConditionEnvironment=WAYLAND_DISPLAY\n\
+             \n\
+             [Service]\n\
+             Type=simple\n\
+             ExecStart=\"{}\" daemon\n\
+             Restart=on-failure\n\
+             RestartSec=3\n\
+             \n\
+             [Install]\n\
+             WantedBy=graphical-session.target\n",
+            exe.display()
+        ),
+    )?;
+    println!("Wrote {}", unit.display());
+    // A daemon started by hand holds the lock; let the service take over.
+    let _ = daemon::send("quit", false);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for args in [&["daemon-reload"][..], &["enable", "--now", "scrawl.service"][..]] {
+        let status = std::process::Command::new("systemctl").arg("--user").args(args).status()?;
+        if !status.success() {
+            bail!("systemctl --user {} failed", args.join(" "));
+        }
+    }
+    println!("Enabled scrawl.service: it starts with each Hyprland session. Status: systemctl --user status scrawl");
     Ok(())
 }
 

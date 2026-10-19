@@ -39,6 +39,19 @@ Captures go to `~/.local/share/scrawl/captures/` (`SCRAWL_CAPTURES_DIR`). The lo
 Requirements, all in Omarchy's base set: `gpu-screen-recorder ffmpeg wl-clipboard wtype slurp`, plus Vulkan for
 the review window.
 
+Build and install, then run it as a service:
+
+```sh
+cargo build --release
+install -m755 target/release/scrawl ~/.local/bin/scrawl
+scrawl setup service     # systemd user service tied to the Hyprland session; restarts if it crashes
+scrawl doctor
+```
+
+The service starts with each Hyprland session and adds the shortcuts. `systemctl --user status scrawl`
+and `journalctl --user -u scrawl` show how it is doing. Without the service, `scrawl toggle` starts
+the daemon on demand, but the shortcuts only exist once the daemon is running.
+
 Transcription uses whisper.cpp:
 
 ```sh
