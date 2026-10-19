@@ -88,12 +88,53 @@ if scrawl_obs then
 end
 "#;
 
+/// Who may have the hook on. Injecting (including after a config reload) and switching off both
+/// happen under this lock, so a reload can't switch the consuming Esc bind back on after the
+/// recording let go, and nothing can inject after `close` (the daemon is exiting).
+struct Hook {
+    on: bool,
+    closed: bool,
+}
+
+static HOOK: std::sync::Mutex<Hook> = std::sync::Mutex::new(Hook { on: false, closed: false });
+
+fn hook() -> std::sync::MutexGuard<'static, Hook> {
+    HOOK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn inject() -> Result<()> {
+    let mut hook = hook();
+    anyhow::ensure!(!hook.closed, "the daemon is shutting down");
     crate::linux::hypr::eval(&inject_lua(&log_path().display().to_string()))?;
+    hook.on = true;
     Ok(())
 }
 
+/// Injects again after `hyprctl reload` wiped the Lua state, only while a recording owns the hook.
+fn reinject() -> Result<()> {
+    let hook = hook();
+    if hook.on && !hook.closed {
+        crate::linux::hypr::eval(&inject_lua(&log_path().display().to_string()))?;
+    }
+    Ok(())
+}
+
+/// Switches the hook off for good: the daemon is exiting, and no later start or reload may
+/// inject it again.
+pub fn close() {
+    let mut hook = hook();
+    hook.closed = true;
+    hook.on = false;
+    if let Err(e) = crate::linux::hypr::eval(STOP_LUA) {
+        scrawl_log(format!("input hook stop: {e:#}"));
+    }
+}
+
+/// Switches the hook and its binds off. Safe to call when nothing was injected (a new daemon calls
+/// it to clear whatever an earlier one left behind).
 pub fn disable() {
+    let mut hook = hook();
+    hook.on = false;
     if let Err(e) = crate::linux::hypr::eval(STOP_LUA) {
         scrawl_log(format!("input hook stop: {e:#}"));
     }
@@ -110,32 +151,37 @@ impl Source {
         let path = log_path();
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, b"")?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut threads = Vec::new();
-
-        // Tail first, so the initial modifier line isn't missed.
-        let mut file = std::fs::File::open(&path)?;
-        file.seek(SeekFrom::End(0))?;
-        {
-            let (stop, t) = (Arc::clone(&stop), Arc::clone(&telemetry));
-            threads.push(std::thread::Builder::new().name("scrawl-input-tail".into()).spawn(move || {
+        let mut source = Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+        };
+        // Anything that fails part way undoes what was started: no thread or Esc bind is left on.
+        let started = (|| -> Result<()> {
+            // Tail first, so the initial modifier line isn't missed.
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::End(0))?;
+            let (stop, t) = (Arc::clone(&source.stop), Arc::clone(&telemetry));
+            source.threads.push(std::thread::Builder::new().name("scrawl-input-tail".into()).spawn(move || {
                 tail(file, &t, &stop);
             })?);
-        }
-        inject()?;
-        {
-            let (stop, t) = (Arc::clone(&stop), Arc::clone(&telemetry));
-            threads.push(std::thread::Builder::new().name("scrawl-cursor".into()).spawn(move || {
+            inject()?;
+            let (stop, t) = (Arc::clone(&source.stop), Arc::clone(&telemetry));
+            source.threads.push(std::thread::Builder::new().name("scrawl-cursor".into()).spawn(move || {
                 sample_cursor(&t, &stop);
             })?);
-        }
-        {
-            let (stop, t) = (Arc::clone(&stop), Arc::clone(&telemetry));
-            threads.push(std::thread::Builder::new().name("scrawl-hypr-events".into()).spawn(move || {
+            let (stop, t) = (Arc::clone(&source.stop), Arc::clone(&telemetry));
+            source.threads.push(std::thread::Builder::new().name("scrawl-hypr-events".into()).spawn(move || {
                 hypr_events(&t, &stop);
             })?);
+            Ok(())
+        })();
+        match started {
+            Ok(()) => Ok(source),
+            Err(e) => {
+                source.stop();
+                Err(e)
+            }
         }
-        Ok(Self { stop, threads })
     }
 
     pub fn stop(self) {
@@ -291,7 +337,7 @@ fn hypr_events(telemetry: &SharedCaptureTelemetry, stop: &AtomicBool) {
             }
             "configreloaded" => {
                 scrawl_log("Hyprland config reloaded: injecting the input hook again");
-                if let Err(e) = inject() {
+                if let Err(e) = reinject() {
                     scrawl_log(format!("re-inject failed: {e:#}"));
                 }
             }

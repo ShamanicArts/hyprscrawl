@@ -189,6 +189,8 @@ enum State {
 
 struct Daemon {
     state: Mutex<State>,
+    /// Set once shutdown starts: no new recording may begin.
+    closing: std::sync::atomic::AtomicBool,
     telemetry: Arc<SharedCaptureTelemetry>,
     last_bundle: Mutex<Option<PathBuf>>,
 }
@@ -230,6 +232,9 @@ impl Daemon {
 
     fn start_on(&self, target: Option<TargetInfo>) -> Result<String> {
         let mut state = self.state.lock().unwrap();
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok("shutting down".into());
+        }
         match &*state {
             State::Recording(_) => return Ok("already recording".into()),
             State::Finishing => return Ok("still finishing the last capture".into()),
@@ -241,8 +246,14 @@ impl Daemon {
         let started = Instant::now();
         self.telemetry
             .reset_for_session(target.frame, started, current_mods());
-        let source = events::Source::start(Arc::clone(&self.telemetry))
-            .context("Could not hook input (hyprctl eval)")?;
+        let source = match events::Source::start(Arc::clone(&self.telemetry)) {
+            Ok(source) => source,
+            Err(e) => {
+                self.telemetry.finish_session();
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e.context("Could not hook input (hyprctl eval)"));
+            }
+        };
         let session = ScreenCaptureSession::start_at(target.clone(), Some(dir.join("recording.mp4")), started);
         if !session.is_recording() {
             source.stop();
@@ -430,6 +441,31 @@ impl Daemon {
         Ok(dir.display().to_string())
     }
 
+    /// Ends the daemon without losing work: a recording is finished (saved), a capture that is
+    /// already finishing is waited for. Then the input hook is switched off and the process exits.
+    fn shutdown(self: &Arc<Self>, reason: &str, before_exit: impl FnOnce()) -> ! {
+        // Set before looking at the state; start_on checks it under the state lock, so a start
+        // either completes before this loop sees it (and is finished below) or never begins.
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let finishing = match &*self.state.lock().unwrap() {
+                State::Idle => break,
+                State::Recording(_) => false,
+                State::Finishing => true,
+            };
+            if finishing {
+                std::thread::sleep(Duration::from_millis(100));
+            } else if let Err(e) = self.stop(reason) {
+                scrawl_log(format!("finishing on {reason}: {e:#}"));
+            }
+        }
+        events::close();
+        let _ = std::fs::remove_file(socket_path());
+        scrawl_log(format!("daemon exiting ({reason})"));
+        before_exit();
+        std::process::exit(0);
+    }
+
     fn status(&self) -> String {
         match &*self.state.lock().unwrap() {
             State::Idle => "idle".into(),
@@ -507,6 +543,41 @@ fn target_label(t: &TargetInfo) -> String {
 }
 
 /// Runs the daemon until `quit`.
+/// The termination signal received, if any (set by `on_termination`).
+static TERMINATION: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_termination(sig: libc::c_int) {
+    // Async-signal-safe: only an atomic store.
+    TERMINATION.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// SIGTERM / SIGINT / SIGHUP (a service stop or restart, Ctrl+C) end the daemon the way `quit`
+/// does: a recording is finished and saved, a finishing one completes, then the daemon exits. A
+/// handler records the signal; `watch_termination` acts on it. The signals are caught, not
+/// blocked: a blocked mask is inherited by every child, and gpu-screen-recorder, ffmpeg and
+/// whisper-cli must still stop when signalled. (Caught handlers reset to the default on exec.)
+fn handle_termination() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_termination as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+fn watch_termination(daemon: Arc<Daemon>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let sig = TERMINATION.load(std::sync::atomic::Ordering::SeqCst);
+        if sig != 0 {
+            scrawl_log(format!("signal {sig}: finishing up and exiting"));
+            daemon.shutdown("signal", || {});
+        }
+    });
+}
+
 pub fn run(record_now: bool) -> Result<()> {
     let dir = gsr::runtime_dir();
     std::fs::create_dir_all(&dir)?;
@@ -516,15 +587,23 @@ pub fn run(record_now: bool) -> Result<()> {
         bail!("another scrawl daemon is running");
     }
     hypr::signature().context("Scrawl on Linux needs a Hyprland session")?;
+    // A daemon that died while recording (crash, kill, service restart) left its input hook in
+    // Hyprland, including the bind that consumes Esc. This daemon owns the hook now: switch it off.
+    events::disable();
+    // Its recorder may have been killed with it; let Omarchy's bar stop showing a recording.
+    desktop::refresh_indicators();
+    handle_termination();
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     let (tx, rx) = flume::unbounded();
     let daemon = Arc::new(Daemon {
         state: Mutex::new(State::Idle),
+        closing: std::sync::atomic::AtomicBool::new(false),
         telemetry: SharedCaptureTelemetry::new(tx),
         last_bundle: Mutex::new(None),
     });
+    watch_termination(Arc::clone(&daemon));
     {
         // Esc and Ctrl+Z from the input source.
         let d = Arc::clone(&daemon);
@@ -621,11 +700,14 @@ fn serve(d: &Arc<Daemon>, conn: UnixStream) -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_default()),
         "quit" => {
-            let _ = d.stop("quit");
-            let _ = std::fs::remove_file(socket_path());
-            let mut c = &conn;
-            let _ = writeln!(c, "ok bye");
-            std::process::exit(0);
+            // Waits for a capture in progress (recording or finishing), replies, then exits.
+            if !matches!(&*d.state.lock().unwrap(), State::Idle) {
+                scrawl_log("quit: finishing the capture in progress first");
+            }
+            d.shutdown("quit", || {
+                let mut c = &conn;
+                let _ = writeln!(c, "ok bye");
+            })
         }
         other => Err(anyhow::anyhow!("unknown command {other:?}")),
     };
@@ -644,8 +726,17 @@ pub fn send(cmd: &str, spawn: bool) -> Result<String> {
     let mut stream = match connect() {
         Ok(s) => s,
         Err(_) if spawn => {
-            spawn_daemon()?;
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // With the service installed, systemd owns the daemon: a daemon started here would
+            // hold the lock and keep the service from ever starting again.
+            let service = service_installed();
+            if service {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "start", "scrawl.service"])
+                    .status();
+            } else {
+                spawn_daemon()?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 if let Ok(s) = connect() {
                     break s;
@@ -671,7 +762,87 @@ pub fn send(cmd: &str, spawn: bool) -> Result<String> {
     }
 }
 
+/// Whether `scrawl setup service` installed the systemd user service.
+fn service_installed() -> bool {
+    dirs::config_dir().is_some_and(|d| d.join("systemd/user/scrawl.service").is_file())
+}
+
+/// Starts a daemon on demand (no service installed) as a transient systemd user unit, so it has
+/// the service's guarantees: a crash restarts it (and the new daemon switches off the dead one's
+/// hook and Esc bind), and the unit's cgroup takes a recorder it left behind with it. Without
+/// systemd at all it falls back to a plain `setsid` daemon, which has no crash cleanup.
 fn spawn_daemon() -> Result<()> {
+    let mut run = std::process::Command::new("systemd-run");
+    run.args(["--user", "--quiet", "--collect", "--unit=scrawl-ondemand"]);
+    for property in crate::linux::cli::UNIT_PROPERTIES {
+        run.args(["-p", property]);
+    }
+    // The user manager may not have this session's variables (no uwsm), so hand them over. The
+    // unit doesn't run in the caller's directory: make relative paths absolute first.
+    let cwd = std::env::current_dir().ok();
+    for (key, mut value) in std::env::vars() {
+        if PATH_VARS.contains(&key.as_str())
+            && let Some(cwd) = &cwd
+            && std::path::Path::new(&value).is_relative()
+        {
+            value = cwd.join(&value).display().to_string();
+        }
+        if key.starts_with("SCRAWL_")
+            || matches!(
+                key.as_str(),
+                "WAYLAND_DISPLAY" | "HYPRLAND_INSTANCE_SIGNATURE" | "XDG_RUNTIME_DIR" | "DBUS_SESSION_BUS_ADDRESS" | "OMARCHY_PATH" | "PATH" | "CODEX_HOME"
+            )
+        {
+            run.arg(format!("--setenv={key}={value}"));
+        }
+    }
+    let ran = run
+        .arg(exe())
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match ran {
+        Ok(out) if out.status.success() => Ok(()),
+        // Another command started the unit first (two at once, before the socket existed): wait
+        // for that daemon rather than starting a competitor for the lock.
+        Ok(_) if ondemand_unit_running() => Ok(()),
+        Ok(out) => bail!(
+            "could not start the scrawl daemon unit: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            scrawl_log("no systemd-run: starting the daemon without a supervisor");
+            spawn_detached()
+        }
+        Err(e) => Err(e).context("running systemd-run"),
+    }
+}
+
+/// `SCRAWL_*` variables that hold paths.
+const PATH_VARS: [&str; 6] = [
+    "SCRAWL_CAPTURES_DIR",
+    "SCRAWL_CONFIG",
+    "SCRAWL_HELPER",
+    "SCRAWL_MOTION_TRACE",
+    "SCRAWL_WHISPER_CLI",
+    "SCRAWL_WHISPER_MODEL",
+];
+
+/// Whether the on-demand unit is up or on its way up (starting, or waiting to restart).
+fn ondemand_unit_running() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "scrawl-ondemand.service"])
+        .status()
+        .is_ok_and(|s| s.success())
+        || std::process::Command::new("systemctl")
+            .args(["--user", "show", "-p", "ActiveState", "--value", "scrawl-ondemand.service"])
+            .output()
+            .is_ok_and(|o| matches!(String::from_utf8_lossy(&o.stdout).trim(), "activating" | "reloading"))
+}
+
+fn spawn_detached() -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
