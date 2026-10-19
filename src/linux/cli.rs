@@ -17,6 +17,8 @@ const USAGE: &str = "Linux commands:
   scrawl preview [latest|BUNDLE]
                               open the review window (Alt+Shift+R, or click the “saved” notification)
   scrawl paste [BUNDLE]       paste the contact sheet + summary of the latest (or given) capture
+  scrawl screencast start [MONITOR|all] [--no-mic] | stop | status
+                              a plain screen recording (for demos), into ~/Videos/hyprscrawl
   scrawl doctor               check what this machine has
   scrawl hyprland-snippet     print persistent binds for ~/.config/hypr/bindings.lua
   scrawl setup launcher       add “Scrawl” entries (record, review latest) to the app launcher
@@ -45,6 +47,7 @@ pub fn intercept() -> Option<Result<()>> {
             Err(e) => Err(e),
         },
         "quit" => daemon::send("quit", false).map(|_| ()),
+        "screencast" => crate::linux::screencast::run(&args[1..]),
         "cancel" => daemon::send("cancel", false).map(|r| println!("{r}")),
         "daemon" => daemon::run(args.iter().any(|a| a == "--record")),
         "paste" => paste(args.get(1).map(PathBuf::from)),

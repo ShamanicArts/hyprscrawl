@@ -36,11 +36,19 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 /// Whether some gpu-screen-recorder (Omarchy's, or a stale one of ours) is already running.
+/// Another gpu-screen-recorder is running (Omarchy's screen recording, say), apart from a
+/// `scrawl screencast`, which is meant to run alongside.
 pub fn other_running() -> bool {
+    let casts = crate::linux::screencast::pids();
     Command::new("pgrep")
-        .args(["--quiet", "-f", "^gpu-screen-recorder"])
-        .status()
-        .is_ok_and(|s| s.success())
+        .args(["-f", "^gpu-screen-recorder"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .any(|pid| !casts.contains(&pid))
+        })
 }
 
 fn capture_args(target: &TargetInfo) -> Result<Vec<String>> {

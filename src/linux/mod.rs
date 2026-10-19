@@ -11,4 +11,5 @@ pub mod gsr;
 pub mod hypr;
 pub mod overlay;
 pub mod review;
+pub mod screencast;
 pub mod whisper;
