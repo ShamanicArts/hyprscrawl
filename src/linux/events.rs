@@ -27,11 +27,9 @@ pub fn log_path() -> PathBuf {
     crate::linux::gsr::runtime_dir().join("events.log")
 }
 
-/// xkb keycodes (evdev + 8) of the modifiers.
-const SHIFT: [u32; 2] = [50, 62];
-const CTRL: [u32; 2] = [37, 105];
-const ALT: [u32; 2] = [64, 108];
-const LOGO: [u32; 2] = [133, 134];
+/// xkb keycodes (evdev + 8) of the modifier keys, left then right: Shift, Ctrl, Alt, Super. The
+/// injected Lua lists the same keys in the same order.
+const MOD_KEYS: [u32; 8] = [50, 62, 37, 105, 64, 108, 133, 134];
 /// xkb keycode of the key in Z's place.
 const KEY_Z: u32 = 52;
 
@@ -41,6 +39,7 @@ fn inject_lua(path: &str) -> String {
         r#"
 local function opened(p) local f = io.open(p, "a"); if f then f:setvbuf("line") end; return f end
 local function kd(k) local ok, r = pcall(hl.is_key_down, k); return (ok and r) and 1 or 0 end
+local modnames = {{ {{50, "Shift_L"}}, {{62, "Shift_R"}}, {{37, "Control_L"}}, {{105, "Control_R"}}, {{64, "Alt_L"}}, {{108, "Alt_R"}}, {{133, "Super_L"}}, {{134, "Super_R"}} }}
 if scrawl_obs == nil then
   scrawl_obs = {{ on = false, binds = {{}}, mods = {{}} }}
   local o = scrawl_obs
@@ -72,10 +71,17 @@ if o.esc == nil then
 end
 if o.f then pcall(function() o.f:close() end) end
 o.f = opened({p})
+-- Modifiers already held (across a reload, or when the recording starts): the chord filter
+-- needs them, and Rust gets them key by key so releasing one side leaves the other held.
 o.mods = {{}}
+local held = {{}}
+for _, m in ipairs(modnames) do
+  local d = kd(m[2]); if d == 1 then o.mods[m[1]] = true end
+  table.insert(held, d)
+end
 for _, b in ipairs(o.binds) do b:set_enabled(true) end
 o.on = true
-if o.f then o.f:write(string.format("M %d %d %d %d\n", math.max(kd("Shift_L"), kd("Shift_R")), math.max(kd("Control_L"), kd("Control_R")), math.max(kd("Alt_L"), kd("Alt_R")), math.max(kd("Super_L"), kd("Super_R")))) end
+if o.f then o.f:write("M ", table.concat(held, " "), "\n") end
 "#
     )
 }
@@ -202,7 +208,7 @@ impl Source {
 fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBool) {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
-    let mut mods = Mods::default();
+    let mut held = Held::default();
     while !stop.load(Ordering::Acquire) {
         line.clear();
         match reader.read_line(&mut line) {
@@ -226,14 +232,9 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
         let arrival = telemetry.elapsed_ms();
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.as_slice() {
-            ["M", s, c, a, l] => {
-                mods = Mods {
-                    shift: *s == "1",
-                    ctrl: *c == "1",
-                    alt: *a == "1",
-                    logo: *l == "1",
-                };
-                telemetry.set_mods(mods);
+            ["M", keys @ ..] if keys.len() == MOD_KEYS.len() => {
+                held = Held(std::array::from_fn(|i| keys[i] == "1"));
+                telemetry.set_mods(held.mods());
             }
             ["K", code, state, time] => {
                 let (Ok(code), Ok(state)) = (code.parse::<u32>(), state.parse::<u32>()) else {
@@ -241,23 +242,16 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
                 };
                 let t = key_time(telemetry, time.parse().ok(), arrival);
                 let down = state != 0;
-                if SHIFT.contains(&code) {
-                    mods.shift = down;
-                } else if CTRL.contains(&code) {
-                    mods.ctrl = down;
-                } else if ALT.contains(&code) {
-                    mods.alt = down;
-                } else if LOGO.contains(&code) {
-                    mods.logo = down;
+                let mods = held.mods();
+                if held.set(code, down) {
+                    telemetry.set_mods(held.mods());
                 } else if down && code == KEY_Z && mods.ctrl && !mods.alt && !mods.shift && !mods.logo {
                     // Upstream's ⌘Z: undo the last stroke (the app gets the key too).
                     let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
                     continue;
                 } else if down {
                     telemetry.key_down(t, code.saturating_sub(8));
-                    continue;
                 }
-                telemetry.set_mods(mods);
             }
             ["X", "esc"] => {
                 let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::CancelCapture);
@@ -287,6 +281,32 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
                 telemetry.scroll(arrival, x, y, dx, dy);
             }
             _ => {}
+        }
+    }
+}
+
+/// Which modifier keys are down, each side on its own (in `MOD_KEYS` order): letting go of one
+/// Shift while the other is still held keeps Shift held.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct Held([bool; 8]);
+
+impl Held {
+    /// Records a modifier key's state; false if `code` isn't a modifier key.
+    fn set(&mut self, code: u32, down: bool) -> bool {
+        let Some(i) = MOD_KEYS.iter().position(|&k| k == code) else {
+            return false;
+        };
+        self.0[i] = down;
+        true
+    }
+
+    fn mods(self) -> Mods {
+        let k = self.0;
+        Mods {
+            shift: k[0] || k[1],
+            ctrl: k[2] || k[3],
+            alt: k[4] || k[5],
+            logo: k[6] || k[7],
         }
     }
 }
@@ -347,5 +367,32 @@ fn hypr_events(telemetry: &SharedCaptureTelemetry, stop: &AtomicBool) {
     });
     if let Err(e) = result {
         scrawl_log(format!("Hyprland event stream: {e:#}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_sides_are_tracked_separately() {
+        let mut held = Held::default();
+        assert!(held.set(50, true)); // left Shift
+        assert!(held.set(62, true)); // right Shift
+        assert!(held.set(62, false));
+        assert!(held.mods().shift, "left Shift is still down");
+        assert!(held.set(50, false));
+        assert!(!held.mods().shift);
+        assert!(held.set(105, true)); // right Ctrl
+        assert!(held.mods().ctrl && !held.mods().alt && !held.mods().logo);
+        assert!(!held.set(KEY_Z, true), "Z isn't a modifier");
+    }
+
+    #[test]
+    fn injected_lua_reports_every_modifier_key() {
+        let lua = inject_lua("/x");
+        for code in MOD_KEYS {
+            assert!(lua.contains(&format!("{{{code}, \"")), "no seed for key {code}");
+        }
     }
 }
