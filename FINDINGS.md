@@ -1,6 +1,6 @@
 # Omarchy fork: findings
 
-These are measured on wubulon (Omarchy 4.0.4, Hyprland 0.56.2, gsr 6.1.0, AMD RX 6600 + NVIDIA GTX 1660 SUPER), 2026-10-19.
+These are measured on one Omarchy desktop (Omarchy 4.0.4, Hyprland 0.56.2, gsr 6.1.0, AMD RX 6600 + NVIDIA GTX 1660 SUPER), 2026-10-19.
 ✅ means measured or read in source. 🟡 means inferred.
 
 ## E1: in-compositor Lua as the input source ✅ works
@@ -44,14 +44,12 @@ Safe: `set_enabled(false/true)`, `EventSubscription:remove()`, removing binds on
 - gsr logs one `failed to write frame index 1 to muxer` at start. It is harmless; the duration is correct.
 
 ## Other corrections to the packet
-- wubulon has both an AMD RX 6600 and an NVIDIA GTX 1660 SUPER, not AMD only.
 - gsr `-w focused` is X11-only, like `-w <window_id>`.
 - The CUA source is local at `~/src/cua` (MIT).
 - `hl.on` returns an `HL.EventSubscription` with `:remove()`. Stubs are in `/usr/share/hypr/stubs/hl.meta.lua`.
 - `AQ_BACKENDS=headless` aborts (`CBackend::create() failed`), so it can't be used for invisible tests. Nested runs as a window on a silent
   workspace (`hl.exec_cmd(cmd, {workspace = "19 silent", no_initial_focus = true})`). A hidden nested instance does not render, so
   screencopy (`grim`) against it hangs.
-- exe.dev plan = 2 vCPU / 8 GB total across all VMs, so a new VM can't make builds faster. Use the `warmap` VM for compile checks.
 
 ## Fork shape (cherry-pick friendly)
 - Irreducibly Mac modules are swapped on Linux with `#[cfg_attr(target_os = "linux", path = "linux/…")]` in `main.rs`, so upstream files
@@ -67,7 +65,7 @@ Ground truth was 26 Kokoro-TTS words concatenated at known offsets, 15 s total (
   flash attention is the default.
 - `-nfa --dtw base.en` gave word starts a median **130 ms late** (max 247 ms, all late). We shift by 100 ms and
   mark the words as measured. Models without a DTW preset fall back to offsets with `estimated: true`.
-- A 15 s clip transcribes in ~1.5 s on wubulon with 6 threads under `nice`.
+- A 15 s clip transcribes in ~1.5 s on that machine with 6 threads under `nice`.
 
 ## First real-session capture ✅
 Daemon `scrawl start` → 8 s → `scrawl stop` on DP-4:
