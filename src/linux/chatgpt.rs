@@ -26,8 +26,10 @@ const MAX_UPLOAD_BYTES: u64 = 19 * 1024 * 1024;
 /// Below this share of cloud words found in whisper's words, the alignment isn't trusted.
 const MIN_ALIGNED: f64 = 0.6;
 
+/// ChatGPT is chosen in the config or `SCRAWL_TRANSCRIBER`. A `--transcriber` on the command line
+/// (`reprocess`, `import`) names an upstream engine, which on Linux means whisper.cpp: no upload.
 pub fn enabled() -> bool {
-    std::env::var("SCRAWL_TRANSCRIBER")
+    !crate::transcribe::overridden() && std::env::var("SCRAWL_TRANSCRIBER")
         .ok()
         .or_else(crate::handoff::transcriber)
         .is_some_and(|name| name.trim().eq_ignore_ascii_case("chatgpt"))

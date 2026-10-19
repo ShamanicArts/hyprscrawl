@@ -117,6 +117,11 @@ pub fn set_override(engine: Engine) {
     );
 }
 
+/// Whether `--transcriber` pinned the engine for this process.
+pub fn overridden() -> bool {
+    OVERRIDE.load(Ordering::Relaxed) != 0
+}
+
 /// Missing microphones and a failed transcriber never prevent saving a bundle.
 pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> TranscriptData {
     let (Some(wav), Some(audio)) = (wav, audio.filter(|audio| audio.sample_count > 0)) else {

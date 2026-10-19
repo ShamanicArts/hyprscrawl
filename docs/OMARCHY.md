@@ -71,6 +71,7 @@ The audio is uploaded to OpenAI. The service returns text without word times, so
 installed it runs alongside and the ChatGPT words take whisper's timings (33 ms median word-start error
 on a ground-truth clip). Without whisper, the words are spread over the detected speech and marked
 estimated, so spoken cues don't cut keyframes. If ChatGPT fails, whisper.cpp transcribes instead.
+`scrawl reprocess` / `import` with `--transcriber apple` (or `hex`) stay local for that run: nothing is uploaded.
 
 If you already set up Voxtype dictation, its `~/.local/share/voxtype/models/ggml-*.bin` is reused (read-only).
 `SCRAWL_WHISPER_CLI` / `SCRAWL_WHISPER_MODEL` override the lookup, and a `whisper-cli` next to the `scrawl`
