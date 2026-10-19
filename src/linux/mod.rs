@@ -9,4 +9,5 @@ pub mod events;
 pub mod gsr;
 pub mod hypr;
 pub mod overlay;
+pub mod review;
 pub mod whisper;

@@ -24,10 +24,11 @@ pub fn run_app(
     if start_iphone_immediately {
         eprintln!("iPhone capture is macOS-only");
     }
-    if let Some((dir, _)) = initial_bundle {
-        println!("{}", dir.display());
-    }
     let _ = screenshot_out;
+    if let Some((dir, bundle)) = initial_bundle {
+        crate::linux::review::run(dir, bundle);
+        return;
+    }
     if let Err(e) = crate::linux::daemon::run(start_recording_immediately) {
         eprintln!("scrawl: {e:#}");
         std::process::exit(1);

@@ -58,3 +58,26 @@ Safe: `set_enabled(false/true)`, `EventSubscription:remove()`, removing binds on
   stay byte-identical: capture, helper, ui, settings, sparkle, laser_overlay, icons.
 - Nearly portable modules get a handful of `cfg` lines (windows, retention, handoff's non-mac stubs). Schema types are never copied.
 - `helper.rs` becomes an ffmpeg/ffprobe/whisper-cli shim with the same signatures. Its `transcribe` fills the default ("apple") engine slot.
+
+## §5 #8: whisper.cpp word timing ✅
+Ground truth was 26 Kokoro-TTS words concatenated at known offsets, 15 s total (`ggml-base.en`, CPU).
+- With default token offsets the text was perfect, but word starts were a median **354 ms early**, max 825 ms.
+  That is too early for spoken cues.
+- `--dtw base.en` alone did nothing: `t_dtw = -1`, because DTW is skipped while flash attention is on, and
+  flash attention is the default.
+- `-nfa --dtw base.en` gave word starts a median **130 ms late** (max 247 ms, all late). We shift by 100 ms and
+  mark the words as measured. Models without a DTW preset fall back to offsets with `estimated: true`.
+- A 15 s clip transcribes in ~1.5 s on wubulon with 6 threads under `nice`.
+
+## First real-session capture ✅
+Daemon `scrawl start` → 8 s → `scrawl stop` on DP-4:
+- gsr offset 855 ms.
+- 37 candidate frames decoded in 681 ms.
+- Window log from `hyprctl clients` fed upstream's autocrop ("Cropped to: the activity in vivaldi-snapshot").
+- `audio.wav` = 0.855 s pad + 8.19 s mic.
+- Stop to saved took 2.4 s.
+- Upstream's keyframe badges and contact-sheet layout are intact.
+
+## Overlay ✅ (nested)
+- The overlay maps as layer `scrawl-overlay` covering the whole monitor.
+- A click through the overlay reached the GTK client underneath.

@@ -11,6 +11,7 @@ use crate::linux::{daemon, desktop, gsr, hypr, whisper};
 const USAGE: &str = "Linux commands:
   scrawl toggle               start or finish a recording (bind this to a key)
   scrawl start | stop         explicit start / finish
+  scrawl pick                 drag an area or click a window, then record it
   scrawl status               idle, recording or finishing
   scrawl paste [BUNDLE]       paste the contact sheet + summary of the latest (or given) capture
   scrawl doctor               check what this machine has
@@ -25,7 +26,7 @@ pub fn intercept() -> Option<Result<()>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let first = args.first().map(String::as_str)?;
     Some(match first {
-        "toggle" | "start" | "stop" => daemon::send(first, first != "stop").map(|r| println!("{r}")),
+        "toggle" | "start" | "stop" | "pick" => daemon::send(first, first != "stop").map(|r| println!("{r}")),
         "status" | "last" => match daemon::send(first, false) {
             Ok(r) => {
                 println!("{r}");

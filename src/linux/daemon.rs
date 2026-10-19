@@ -144,13 +144,17 @@ return d("Shift_L")..d("Shift_R").." "..d("Control_L")..d("Control_R").." "..d("
 
 impl Daemon {
     fn start(&self) -> Result<String> {
+        self.start_on(None)
+    }
+
+    fn start_on(&self, target: Option<TargetInfo>) -> Result<String> {
         let mut state = self.state.lock().unwrap();
         match &*state {
             State::Recording(_) => return Ok("already recording".into()),
             State::Finishing => return Ok("still finishing the last capture".into()),
             State::Idle => {}
         }
-        let target = crate::capture::discover_target(None);
+        let target = target.unwrap_or_else(|| crate::capture::discover_target(None));
         let dir = captures_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
         std::fs::create_dir_all(&dir)?;
         let started = Instant::now();
@@ -291,7 +295,7 @@ impl Daemon {
                 if copied { "Paste it into your agent." } else { "" }
             ),
             image: sheet.is_file().then_some(sheet.as_path()),
-            on_click: Some(vec!["xdg-open".into(), dir.display().to_string()]),
+            on_click: Some(vec![exe(), "preview".into(), dir.display().to_string()]),
             replaces: processing,
             critical: false,
         });
@@ -306,6 +310,66 @@ impl Daemon {
             State::Finishing => "finishing".into(),
         }
     }
+}
+
+/// Upstream's tap rule: the shortcut's modifiers come up within 250 ms. Polled through the
+/// compositor, since the shortcut fires on key down.
+fn held_past_tap() -> bool {
+    let lua = r#"local function d(k) local ok, r = pcall(hl.is_key_down, k); return ok and r end
+return (d("Shift_L") or d("Shift_R") or d("Control_L") or d("Control_R") or d("Alt_L") or d("Alt_R") or d("Super_L") or d("Super_R")) and "held" or "free""#;
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        match hypr::eval(lua) {
+            Ok(r) if r.contains("held") => std::thread::sleep(Duration::from_millis(15)),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `slurp` over the visible windows: drag for an area, click a window for that window, Esc
+/// cancels. (Omarchy's own region capture uses slurp too.)
+pub fn pick_target() -> Option<TargetInfo> {
+    let windows = hypr::visible_clients().unwrap_or_default();
+    let boxes: String = windows
+        .iter()
+        .map(|c| {
+            format!(
+                "{},{} {}x{} {}\n",
+                c.at[0] as i64, c.at[1] as i64, c.size[0] as i64, c.size[1] as i64,
+                c.class.replace(' ', "_")
+            )
+        })
+        .collect();
+    let mut child = std::process::Command::new("slurp")
+        .args(["-f", "%x %y %w %h %l", "-b", "#00000055", "-c", "#ff3b30", "-s", "#ff3b3022", "-w", "2"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .inspect_err(|e| scrawl_log(format!("slurp: {e}")))
+        .ok()?;
+    child.stdin.take()?.write_all(boxes.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let f: Vec<&str> = text.split_whitespace().collect();
+    let num = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok());
+    let (x, y, w, h) = (num(0)?, num(1)?, num(2)?, num(3)?);
+    if w < 16.0 || h < 16.0 {
+        return None;
+    }
+    let label = f.get(4).copied().unwrap_or("");
+    let picked_window = windows.iter().find(|c| {
+        (c.at[0] - x).abs() < 1.0 && (c.at[1] - y).abs() < 1.0 && (c.size[0] - w).abs() < 1.0 && (c.size[1] - h).abs() < 1.0
+            && (label.is_empty() || c.class.replace(' ', "_") == label)
+    });
+    Some(match picked_window {
+        Some(c) => crate::capture::discover_target_window(c),
+        None => crate::capture::region_target(x, y, w, h),
+    })
 }
 
 fn target_label(t: &TargetInfo) -> String {
@@ -383,8 +447,22 @@ fn serve(d: &Arc<Daemon>, conn: UnixStream) -> Result<()> {
     let reply = match cmd {
         "toggle" => {
             let recording = matches!(&*d.state.lock().unwrap(), State::Recording(_));
-            if recording { d.stop("toggle") } else { d.start() }
+            if recording {
+                d.stop("toggle")
+            } else if held_past_tap() {
+                // Held like upstream's switcher: pick an area or a window.
+                match pick_target() {
+                    Some(t) => d.start_on(Some(t)),
+                    None => Ok("cancelled".into()),
+                }
+            } else {
+                d.start()
+            }
         }
+        "pick" => match pick_target() {
+            Some(t) => d.start_on(Some(t)),
+            None => Ok("cancelled".into()),
+        },
         "start" => d.start(),
         "stop" => d.stop("stop"),
         "status" => Ok(d.status()),

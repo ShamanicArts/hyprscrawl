@@ -273,25 +273,7 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
             c.class.to_ascii_lowercase().contains(&q) || c.title.to_ascii_lowercase().contains(&q)
         })
     {
-        let scale = monitors
-            .iter()
-            .find(|m| m.id == c.monitor)
-            .map_or(1.0, |m| m.scale);
-        return TargetInfo {
-            mode: CaptureMode::Window,
-            app: Some(c.class.clone()),
-            bundle_id: Some(c.class.clone()),
-            window_title: Some(c.title.clone()),
-            window_id: Some(c.id()),
-            display_id: c.monitor.max(0) as u32,
-            frame: TargetFrame {
-                x: c.at[0],
-                y: c.at[1],
-                width: c.size[0],
-                height: c.size[1],
-                scale,
-            },
-        };
+        return discover_target_window(c);
     }
     let p = point.or_else(|| current_mouse_screen().map(|[x, y]| [f64::from(x), f64::from(y)]));
     let m = p
@@ -314,6 +296,30 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                 height: 1080.0,
                 scale: 1.0,
             },
+        },
+    }
+}
+
+/// A window as the capture target (recorded as a static region of its current rect).
+pub fn discover_target_window(c: &crate::linux::hypr::Client) -> TargetInfo {
+    let scale = crate::linux::hypr::monitors()
+        .unwrap_or_default()
+        .iter()
+        .find(|m| m.id == c.monitor)
+        .map_or(1.0, |m| m.scale);
+    TargetInfo {
+        mode: CaptureMode::Window,
+        app: Some(c.class.clone()),
+        bundle_id: Some(c.class.clone()),
+        window_title: Some(c.title.clone()),
+        window_id: Some(c.id()),
+        display_id: c.monitor.max(0) as u32,
+        frame: TargetFrame {
+            x: c.at[0],
+            y: c.at[1],
+            width: c.size[0],
+            height: c.size[1],
+            scale,
         },
     }
 }
