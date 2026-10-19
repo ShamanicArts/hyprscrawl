@@ -50,6 +50,7 @@ pub fn intercept() -> Option<Result<()>> {
         }
         "setup" if args.get(1).map(String::as_str) == Some("transcription") => setup_transcription(),
         "debug-events" => debug_events(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)),
+        "debug-overlay" => debug_overlay(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4)),
         "help-linux" => {
             println!("{USAGE}");
             Ok(())
@@ -172,5 +173,23 @@ fn debug_events(seconds: u64) -> Result<()> {
     source.stop();
     let (events, strokes) = telemetry.finish_session();
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "events": events, "strokes": strokes }))?);
+    Ok(())
+}
+
+/// Shows the overlay (start glow + a synthetic Shift-ink stroke) for N seconds.
+fn debug_overlay(seconds: u64) -> Result<()> {
+    let target = crate::capture::discover_target(None);
+    let (tx, _rx) = flume::unbounded();
+    let t = crate::capture::SharedCaptureTelemetry::new(tx);
+    t.reset_for_session(target.frame, std::time::Instant::now(), crate::capture::Mods::default());
+    t.set_mods(crate::capture::Mods { shift: true, ..Default::default() });
+    let f = target.frame;
+    for i in 0..60 {
+        let a = i as f64 / 59.0 * std::f64::consts::TAU;
+        t.cursor_sample(i * 16, f.x + f.width * (0.5 + 0.15 * a.cos()), f.y + f.height * (0.5 + 0.2 * a.sin()));
+    }
+    let overlay = crate::linux::overlay::Overlay::start(std::sync::Arc::clone(&t), &target)?;
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    overlay.stop();
     Ok(())
 }

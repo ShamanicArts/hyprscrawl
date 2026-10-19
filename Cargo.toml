@@ -33,6 +33,12 @@ objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
 metal = "0.29.0"
 screencapturekit = { version = "=11.0.0", features = ["macos_15_0"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
 [profile.dev]
 debug = 0
 opt-level = 2
