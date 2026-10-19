@@ -1,4 +1,4 @@
-# Scrawl on Omarchy (Linux / Hyprland)
+# Hyprscrawl: Scrawl on Hyprland (Omarchy)
 
 This fork runs Scrawl on stock Omarchy 4 (Hyprland ≥ 0.55 with a Lua config, Wayland). It produces the same
 `.scrawl` bundles as macOS Scrawl: `contact-sheet.png`, `frames/frame-XX.png`, `summary.md`, `scrawl.json`,
@@ -35,6 +35,19 @@ Transcription uses whisper.cpp:
 omarchy-pkg-add whisper-cpp     # provides whisper-cli
 scrawl setup transcription      # downloads ggml-base.en (148 MB), after asking
 ```
+
+Or use the transcription that comes with a ChatGPT subscription (the same endpoint ChatGPT and Codex
+voice input use), signed in through the Codex CLI:
+
+```sh
+codex login                             # once, if you haven't
+scrawl setup transcription chatgpt      # back to local only: scrawl setup transcription local
+```
+
+The audio is uploaded to OpenAI. The service returns text without word times, so when whisper.cpp is
+installed it runs alongside and the ChatGPT words take whisper's timings (33 ms median word-start error
+on a ground-truth clip). Without whisper, the words are spread over the detected speech and marked
+estimated, so spoken cues don't cut keyframes. If ChatGPT fails, whisper.cpp transcribes instead.
 
 If you already set up Voxtype dictation, its `~/.local/share/voxtype/models/ggml-*.bin` is reused (read-only).
 `SCRAWL_WHISPER_CLI` / `SCRAWL_WHISPER_MODEL` override the lookup, and a `whisper-cli` next to the `scrawl`

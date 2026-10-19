@@ -1,3 +1,8 @@
+> **Hyprscrawl** is a fork of [kitlangton/scrawl](https://github.com/kitlangton/scrawl) that runs on
+> Linux under Hyprland (built and tested on Omarchy). It makes the same bundles from the same pipeline,
+> with the macOS capture layer swapped for Hyprland and Wayland. See [docs/OMARCHY.md](docs/OMARCHY.md)
+> for setup and how the fork tracks upstream. The rest of this README is upstream's.
+
 # Scrawl
 
 Show an agent a problem instead of describing it.
