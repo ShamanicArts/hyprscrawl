@@ -137,6 +137,25 @@ pub fn eval(lua: &str) -> Result<String> {
     Ok(reply)
 }
 
+/// Runs a Lua chunk that `return`s a value and gives back that value as text. `eval` itself only
+/// ever answers "ok", so the chunk writes its value to a file for the answer.
+pub fn eval_value(lua: &str) -> Result<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = crate::linux::gsr::runtime_dir();
+    std::fs::create_dir_all(&dir)?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("eval-{}-{n}.out", std::process::id()));
+    let chunk = format!(
+        "local scrawl_result = tostring((function()\n{lua}\nend)())\nlocal f = io.open({}, \"w\")\nif f then f:write(scrawl_result); f:close() end",
+        lua_str(&path.display().to_string())
+    );
+    let ran = eval(&chunk);
+    let value = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    ran?;
+    value.context("the Lua chunk gave no result")
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct CursorPos {
     pub x: f64,
