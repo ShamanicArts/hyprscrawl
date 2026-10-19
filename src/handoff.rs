@@ -61,26 +61,22 @@ fn newest_bundle(captures: &Path) -> Result<PathBuf> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "scrawl") && path.is_dir() {
-            // Bundle creation time is stable even after later zoom-frame extraction.
-            let created = fs::read(path.join("scrawl.json"))
+            // Only finished bundles count: a capture still recording, or one cut off by a crash,
+            // has no valid manifest yet and would otherwise hide the last good one (its media is
+            // left in place). Bundle creation time is stable even after later zoom-frame extraction.
+            if let Some(created) = fs::read(path.join("scrawl.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<ScrawlBundle>(&bytes).ok())
                 .map(|bundle| bundle.created_at_ms)
-                .unwrap_or_else(|| {
-                    entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |time| time.as_millis() as u64)
-                });
-            candidates.push((created, path));
+            {
+                candidates.push((created, path));
+            }
         }
     }
     candidates.sort_unstable();
     candidates
         .pop()
-        .context("No .scrawl captures found")?
+        .with_context(|| format!("No finished .scrawl captures in {}", captures.display()))?
         .1
         .canonicalize()
         .map_err(Into::into)
@@ -1124,6 +1120,26 @@ mod tests {
         );
         assert!(resolve_bundle_dir(&fixture.0).is_err());
         assert!(resolve_bundle_dir(&fixture.0.join("missing.scrawl")).is_err());
+    }
+
+    #[test]
+    fn newest_capture_skips_unfinished_bundles() {
+        let fixture = Fixture::new();
+        let finished = fixture.bundle("finished", 100);
+        // Newer, but cut off before its manifest was written (a crash, or still recording).
+        let unfinished = fixture.0.join("unfinished.scrawl");
+        fs::create_dir_all(&unfinished).unwrap();
+        fs::write(unfinished.join("recording.mp4"), b"partial").unwrap();
+        let broken = fixture.0.join("broken.scrawl");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("scrawl.json"), b"{not json").unwrap();
+        assert_eq!(
+            newest_bundle(&fixture.0).unwrap(),
+            finished.canonicalize().unwrap()
+        );
+        fs::remove_dir_all(&finished).unwrap();
+        let error = newest_bundle(&fixture.0).unwrap_err().to_string();
+        assert!(error.contains("No finished .scrawl captures"), "{error}");
     }
 
     #[test]

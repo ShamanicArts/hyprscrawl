@@ -167,6 +167,20 @@ fn doctor() -> Result<()> {
 
 /// A systemd user service for the daemon, tied to the graphical session like Omarchy's own: uwsm
 /// hands each Hyprland session's variables to the user manager, so none are written here.
+/// How systemd runs the daemon, for `scrawl.service` and the on-demand unit alike.
+/// - `KillSignal=SIGINT`: the daemon finishes a recording on SIGINT; gpu-screen-recorder (left
+///   behind by a crash) ignores SIGTERM but stops cleanly on SIGINT.
+/// - `KillMode=mixed`: stopping signals only the daemon, so the ffmpeg/whisper/curl workers of a
+///   capture it's saving keep going; whatever is left after it exits is killed.
+/// - `TimeoutStopSec=180`: a stop waits for that save (transcribing a long capture takes a while).
+pub const UNIT_PROPERTIES: [&str; 5] = [
+    "Restart=on-failure",
+    "RestartSec=3",
+    "KillSignal=SIGINT",
+    "KillMode=mixed",
+    "TimeoutStopSec=180",
+];
+
 fn setup_service() -> Result<()> {
     let exe = std::env::current_exe()?;
     let dir = dirs::config_dir().context("no config dir")?.join("systemd/user");
@@ -184,12 +198,12 @@ fn setup_service() -> Result<()> {
              [Service]\n\
              Type=simple\n\
              ExecStart=\"{}\" daemon\n\
-             Restart=on-failure\n\
-             RestartSec=3\n\
+             {}\n\
              \n\
              [Install]\n\
              WantedBy=graphical-session.target\n",
-            exe.display()
+            exe.display(),
+            UNIT_PROPERTIES.join("\n")
         ),
     )?;
     println!("Wrote {}", unit.display());
