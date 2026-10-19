@@ -49,6 +49,7 @@ pub fn intercept() -> Option<Result<()>> {
             Ok(())
         }
         "setup" if args.get(1).map(String::as_str) == Some("transcription") => setup_transcription(),
+        "debug-events" => debug_events(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)),
         "help-linux" => {
             println!("{USAGE}");
             Ok(())
@@ -154,5 +155,22 @@ fn setup_transcription() -> Result<()> {
     if whisper::cli().is_none() {
         println!("Now install whisper-cli: omarchy-pkg-add whisper-cpp");
     }
+    Ok(())
+}
+
+/// Runs only the input source for N seconds against the full screen and prints what it saw:
+/// for testing the Lua hook (e.g. in a nested Hyprland with `SCRAWL_HYPR_SIG`).
+fn debug_events(seconds: u64) -> Result<()> {
+    let target = crate::capture::discover_target(None);
+    let (tx, _rx) = flume::unbounded();
+    let telemetry = crate::capture::SharedCaptureTelemetry::new(tx);
+    let started = std::time::Instant::now();
+    telemetry.reset_for_session(target.frame, started, crate::capture::Mods::default());
+    let source = crate::linux::events::Source::start(std::sync::Arc::clone(&telemetry))?;
+    eprintln!("listening {seconds} s on {:?}", target.frame);
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    source.stop();
+    let (events, strokes) = telemetry.finish_session();
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "events": events, "strokes": strokes }))?);
     Ok(())
 }

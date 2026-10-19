@@ -482,6 +482,8 @@ pub struct SharedCaptureTelemetry {
     await_shift_release: AtomicBool,
     prev_shift_ink: AtomicBool,
     drag_start: Mutex<Option<(u64, f32, f32, TargetFrame)>>,
+    /// Cursor positions (normalized) since the drag began, from the sampler.
+    drag_path: Mutex<Vec<[f32; 2]>>,
     /// Increments on every stroke change, for the overlay.
     pub ink_generation: AtomicU64,
 }
@@ -511,6 +513,7 @@ impl SharedCaptureTelemetry {
             await_shift_release: AtomicBool::new(false),
             prev_shift_ink: AtomicBool::new(false),
             drag_start: Mutex::new(None),
+            drag_path: Mutex::new(Vec::new()),
             ink_generation: AtomicU64::new(0),
         })
     }
@@ -585,10 +588,11 @@ impl SharedCaptureTelemetry {
         self.window_log_request.store(true, Ordering::Release);
         let start_frame = *lock(&self.target_frame);
         *lock(&self.drag_start) = Some((t_ms, nx, ny, start_frame));
+        *lock(&self.drag_path) = vec![[nx, ny]];
     }
 
     /// A mouse button came up: records the click or drag that `pointer_down` began.
-    pub fn pointer_up(&self, t_ms: u64, screen_x: f64, screen_y: f64, right: bool, path: Vec<[f32; 2]>) {
+    pub fn pointer_up(&self, t_ms: u64, screen_x: f64, screen_y: f64, right: bool) {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
@@ -601,6 +605,9 @@ impl SharedCaptureTelemetry {
         }
         let (nx, ny, fw, fh) = self.normalize_point(screen_x, screen_y);
         let dist_px = ((nx - x0) * fw as f32).hypot((ny - y0) * fh as f32);
+        let mut path = std::mem::take(&mut *lock(&self.drag_path));
+        path.push([nx, ny]);
+        let path = thin_path(path, 64);
         let _ = self.ui_sender.try_send(LiveOverlayEvent::RequestSnapshot);
         let event = if dist_px < 12.0 {
             InteractionEvent::Click {
@@ -705,6 +712,13 @@ impl SharedCaptureTelemetry {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
+        if lock(&self.drag_start).is_some() {
+            let (nx, ny, _, _) = self.normalize_point(x, y);
+            let mut path = lock(&self.drag_path);
+            if path.last() != Some(&[nx, ny]) && path.len() < 4_096 {
+                path.push([nx, ny]);
+            }
+        }
         let inside_target = self.contains_screen_point(x, y);
         let pure_shift = self.pure_shift() && !self.await_shift_release.load(Ordering::Acquire);
         let prev_shift_ink = self.prev_shift_ink.load(Ordering::Acquire);
@@ -792,6 +806,17 @@ impl SharedCaptureTelemetry {
     }
 }
 
+fn thin_path(path: Vec<[f32; 2]>, max: usize) -> Vec<[f32; 2]> {
+    if path.len() <= max {
+        return path;
+    }
+    let last = *path.last().unwrap();
+    let step = path.len() as f64 / (max - 1) as f64;
+    let mut out: Vec<[f32; 2]> = (0..max - 1).map(|i| path[(i as f64 * step) as usize]).collect();
+    out.push(last);
+    out
+}
+
 fn event_t(e: &InteractionEvent) -> u64 {
     match e {
         InteractionEvent::Click { t, .. }
@@ -849,9 +874,10 @@ mod tests {
     fn click_drag_and_shift_ink() {
         let t = telemetry();
         t.pointer_down(10, 600.0, 250.0);
-        t.pointer_up(80, 603.0, 251.0, false, Vec::new());
+        t.pointer_up(80, 603.0, 251.0, false);
         t.pointer_down(200, 200.0, 100.0);
-        t.pointer_up(400, 700.0, 300.0, false, vec![[0.3, 0.4]]);
+        t.cursor_sample(300, 450.0, 200.0);
+        t.pointer_up(400, 700.0, 300.0, false);
         t.set_mods(Mods { shift: true, ..Mods::default() });
         for (i, x) in [300.0, 320.0, 340.0, 360.0].iter().enumerate() {
             t.cursor_sample(500 + i as u64 * 16, *x, 200.0);
@@ -862,7 +888,7 @@ mod tests {
         t.cursor_sample(600, 360.0, 200.0);
         let (events, strokes) = t.finish_session();
         assert!(matches!(events[0], InteractionEvent::Click { t: 10, .. }));
-        assert!(matches!(events[1], InteractionEvent::Drag { t: 200, t1: 400, .. }));
+        assert!(matches!(&events[1], InteractionEvent::Drag { t: 200, t1: 400, path, .. } if path.len() == 3));
         assert_eq!(events.len(), 2);
         assert_eq!(strokes.len(), 1);
         assert_eq!(strokes[0].pts.len(), 12);

@@ -146,15 +146,10 @@ impl Source {
     }
 }
 
-struct Pending {
-    path: Vec<[f32; 2]>,
-}
-
 fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBool) {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut mods = Mods::default();
-    let mut drag = Pending { path: Vec::new() };
     while !stop.load(Ordering::Acquire) {
         line.clear();
         match reader.read_line(&mut line) {
@@ -213,11 +208,9 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
                 };
                 let right = *btn == "mouse:273";
                 if *edge == "d" {
-                    drag.path.clear();
                     telemetry.pointer_down(arrival, x, y);
                 } else {
-                    let path = thin(std::mem::take(&mut drag.path), 64);
-                    telemetry.pointer_up(arrival, x, y, right, path);
+                    telemetry.pointer_up(arrival, x, y, right);
                 }
             }
             ["W", dir, x, y] => {
@@ -235,21 +228,7 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
             }
             _ => {}
         }
-        // Collect the path of a drag in progress from the cursor the sampler last saw.
-        if telemetry.drag_started_at().is_some() {
-            let [px, py] = *telemetry.pointer_screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (nx, ny, _, _) = telemetry.normalize_point(f64::from(px), f64::from(py));
-            drag.path.push([nx, ny]);
-        }
     }
-}
-
-fn thin(path: Vec<[f32; 2]>, max: usize) -> Vec<[f32; 2]> {
-    if path.len() <= max {
-        return path;
-    }
-    let step = path.len() as f64 / max as f64;
-    (0..max).map(|i| path[(i as f64 * step) as usize]).collect()
 }
 
 /// The key event's own time (the device's ms on `CLOCK_MONOTONIC`, 32-bit) when it agrees with
