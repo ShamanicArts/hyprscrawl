@@ -280,7 +280,7 @@ impl Daemon {
             activity,
         )?;
         *self.last_bundle.lock().unwrap() = Some(dir.clone());
-        let copied = desktop::copy_text(&summary).is_ok();
+        let copied = std::env::var_os("SCRAWL_NO_CLIPBOARD").is_none() && desktop::copy_text(&summary).is_ok();
         let sheet = dir.join(&bundle.contact_sheet);
         desktop::notify(desktop::Notice {
             title: if copied { "Scrawl saved · copied" } else { "Scrawl saved" },

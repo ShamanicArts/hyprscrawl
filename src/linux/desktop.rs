@@ -102,6 +102,10 @@ pub struct Notice<'a> {
 
 /// Shows a desktop notification; returns its id when the notifier reports one.
 pub fn notify(n: Notice) -> Option<u32> {
+    if std::env::var_os("SCRAWL_NO_NOTIFY").is_some() {
+        crate::capture::scrawl_log(format!("notice: {} — {}", n.title, n.body));
+        return None;
+    }
     if has("omarchy-notification-send") {
         let mut cmd = Command::new("omarchy-notification-send");
         cmd.args(["--app-name", "Scrawl", "-p"]);

@@ -46,17 +46,33 @@ pub fn signature() -> Result<String> {
             candidates.push(v);
         }
     }
-    let mut dirs: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(hypr_dir())
+    // Each instance dir's `hyprland.lock` holds its pid and Wayland socket. Old sessions leave
+    // dirs behind (dead pids), and a nested Hyprland has its own socket: prefer the live
+    // instance serving this session's `$WAYLAND_DISPLAY`, then any live one, newest first.
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let mut dirs: Vec<(bool, std::time::SystemTime, String)> = std::fs::read_dir(hypr_dir())
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().join(".socket.sock").exists())
         .filter_map(|e| {
+            let lock = std::fs::read_to_string(e.path().join("hyprland.lock")).unwrap_or_default();
+            let mut lines = lock.lines();
+            let pid: i32 = lines.next()?.trim().parse().ok()?;
+            let socket = lines.next().unwrap_or("").trim().to_owned();
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return None;
+            }
             let m = e.metadata().ok()?.modified().ok()?;
-            Some((m, e.file_name().to_string_lossy().into_owned()))
+            Some((
+                !wayland.is_empty() && socket == wayland,
+                m,
+                e.file_name().to_string_lossy().into_owned(),
+            ))
         })
         .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let dirs: Vec<(std::time::SystemTime, String)> = dirs.into_iter().map(|(_, m, s)| (m, s)).collect();
     // An explicit override is final; otherwise prefer the env's instance, then the newest live.
     if let Ok(v) = std::env::var("SCRAWL_HYPR_SIG")
         && !v.is_empty()
