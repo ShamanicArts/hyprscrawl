@@ -446,13 +446,14 @@ impl ScreenCaptureSession {
 fn candidates(video: &Path, offset_ms: u64, duration_ms: u64) -> Vec<RgbaFrame> {
     let interval = (duration_ms / 700).max(FRAME_SAMPLE_INTERVAL.as_millis() as u64);
     let started = Instant::now();
-    match crate::helper::frames(video, crate::helper::FrameTimes::Every(interval), CANDIDATE_EDGE as u32) {
-        Ok(raw) => {
-            let mut buf = CandidateBuffer::new(CANDIDATE_BUDGET_BYTES);
-            for mut f in raw {
-                f.t_ms += offset_ms;
-                buf.push(f, false);
-            }
+    // Straight from ffmpeg into the buffer, which thins as it fills: memory stays within its budget.
+    let mut buf = CandidateBuffer::new(CANDIDATE_BUDGET_BYTES);
+    let decoded = crate::helper::frames_every(video, interval, CANDIDATE_EDGE as u32, |mut f| {
+        f.t_ms += offset_ms;
+        buf.push(f, false);
+    });
+    match decoded {
+        Ok(()) => {
             let frames = buf.into_frames();
             scrawl_log(format!(
                 "candidates: {} frames every {interval} ms in {} ms",
