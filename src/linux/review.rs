@@ -261,12 +261,14 @@ impl Render for ReviewWindow {
                                     .border_color(rgb(LINE_COLOR))
                                     .child(tab_chip("tab-contact-sheet", "Contact Sheet", tab == Tab::ContactSheet).on_click(
                                         cx.listener(|this, _, _, cx| {
+                                            crate::capture::scrawl_log("review: Contact Sheet tab");
                                             this.tab = Tab::ContactSheet;
                                             cx.notify();
                                         }),
                                     ))
                                     .child(tab_chip("tab-keyframes", "Keyframes", tab == Tab::Keyframes).on_click(
                                         cx.listener(|this, _, _, cx| {
+                                            crate::capture::scrawl_log("review: Keyframes tab");
                                             this.tab = Tab::Keyframes;
                                             cx.notify();
                                         }),
@@ -293,6 +295,7 @@ impl Render for ReviewWindow {
                             .child(
                                 hint_button("btn-record", "Record", crate::linux::daemon::hotkey(), false).on_click(
                                     cx.listener(|this, _, window, cx| {
+                                        crate::capture::scrawl_log("review: Record");
                                         this.status = Some("Recording…".into());
                                         cx.notify();
                                         std::thread::spawn(|| {
@@ -304,6 +307,7 @@ impl Render for ReviewWindow {
                             )
                             .child(action_button("btn-reveal", "Open Folder", false).on_click(cx.listener(
                                 |this, _, _, cx| {
+                                    crate::capture::scrawl_log("review: Open Folder");
                                     let _ = std::process::Command::new("xdg-open").arg(&this.dir).spawn();
                                     this.status = Some("Opened folder".into());
                                     cx.notify();
@@ -381,6 +385,7 @@ impl Render for ReviewWindow {
 
 impl ReviewWindow {
     fn copy(&mut self, cx: &mut Context<Self>) {
+        crate::capture::scrawl_log("review: Copy");
         let res = crate::handoff::copy_bundle_to_clipboard(&self.dir);
         self.status = Some(match res {
             Ok(()) => "Copied ✓".into(),
