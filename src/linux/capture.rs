@@ -495,6 +495,9 @@ pub struct SharedCaptureTelemetry {
     pub mods: Mutex<Mods>,
     pub events: Mutex<Vec<InteractionEvent>>,
     pub strokes: Mutex<Vec<Stroke>>,
+    /// When Shift let go of each of `strokes` (same order; changed under the `strokes` lock): the
+    /// live ink fades from there. A stroke's `t1` is its last point, which can be much earlier.
+    released: Mutex<Vec<u64>>,
     pub live_ink: Mutex<Option<Stroke>>,
     /// Raised when a click, ink stroke or shortcut starts, so the window log snapshots now.
     pub window_log_request: Arc<AtomicBool>,
@@ -529,6 +532,7 @@ impl SharedCaptureTelemetry {
             mods: Mutex::new(Mods::default()),
             events: Mutex::new(Vec::new()),
             strokes: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
             live_ink: Mutex::new(None),
             window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
@@ -551,7 +555,10 @@ impl SharedCaptureTelemetry {
         *lock(&self.target_frame) = frame;
         *lock(&self.mods) = mods;
         lock(&self.events).clear();
-        lock(&self.strokes).clear();
+        let mut strokes = lock(&self.strokes);
+        strokes.clear();
+        lock(&self.released).clear();
+        drop(strokes);
         *lock(&self.live_ink) = None;
         *lock(&self.drag_start) = None;
         self.shift_held.store(false, Ordering::Release);
@@ -792,7 +799,10 @@ impl SharedCaptureTelemetry {
                     .fold(0.0_f32, f32::max);
                 // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
                 if max_span_px >= 6.0 {
-                    lock(&self.strokes).push(stroke);
+                    let mut strokes = lock(&self.strokes);
+                    strokes.push(stroke);
+                    lock(&self.released).push(t_ms);
+                    drop(strokes);
                     let _ = self.ui_sender.try_send(LiveOverlayEvent::RequestSnapshot);
                 }
             }
@@ -801,13 +811,25 @@ impl SharedCaptureTelemetry {
         self.prev_shift_ink.store(pure_shift, Ordering::Release);
     }
 
-    /// Strokes finished so far plus the one being drawn, for the overlay.
-    pub fn ink_snapshot(&self) -> (Vec<Stroke>, Option<Stroke>) {
-        (lock(&self.strokes).clone(), lock(&self.live_ink).clone())
+    /// Strokes finished so far, each with when Shift let go of it, plus the one being drawn, for
+    /// the overlay.
+    pub fn ink_snapshot(&self) -> (Vec<(Stroke, u64)>, Option<Stroke>) {
+        let strokes = lock(&self.strokes);
+        let released = lock(&self.released);
+        let done = strokes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), released.get(i).copied().unwrap_or(s.t1)))
+            .collect();
+        drop((released, strokes));
+        (done, lock(&self.live_ink).clone())
     }
 
     pub fn undo_stroke(&self) {
-        lock(&self.strokes).pop();
+        let mut strokes = lock(&self.strokes);
+        strokes.pop();
+        lock(&self.released).pop();
+        drop(strokes);
         self.ink_generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -823,6 +845,7 @@ impl SharedCaptureTelemetry {
         let mut events = std::mem::take(&mut *lock(&self.events));
         events.sort_by_key(event_t);
         let strokes = std::mem::take(&mut *lock(&self.strokes));
+        lock(&self.released).clear();
         self.ink_generation.fetch_add(1, Ordering::AcqRel);
         (events, strokes)
     }
@@ -915,6 +938,32 @@ mod tests {
         assert_eq!(strokes.len(), 1);
         assert_eq!(strokes[0].pts.len(), 12);
         assert_eq!(strokes[0].t0, 500);
+    }
+
+    #[test]
+    fn ink_fades_from_the_shift_release() {
+        let (tx, _rx) = flume::unbounded();
+        let t = SharedCaptureTelemetry::new(tx);
+        t.reset_for_session(
+            TargetFrame { x: 0.0, y: 0.0, width: 1000.0, height: 500.0, scale: 1.0 },
+            Instant::now(),
+            Mods::default(),
+        );
+        t.set_mods(Mods { shift: true, ..Mods::default() });
+        t.cursor_sample(10, 100.0, 100.0);
+        t.cursor_sample(30, 200.0, 100.0);
+        t.cursor_sample(50, 300.0, 100.0);
+        // Held still for two seconds, then let go.
+        t.cursor_sample(2_050, 300.0, 100.0);
+        t.set_mods(Mods::default());
+        t.cursor_sample(2_060, 300.0, 100.0);
+        let (done, live) = t.ink_snapshot();
+        assert!(live.is_none());
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0.t1, 50, "the bundle keeps the last point's time");
+        assert!(done[0].1 >= 2_050, "fades from the release, not {}", done[0].1);
+        t.undo_stroke();
+        assert!(t.ink_snapshot().0.is_empty());
     }
 
     #[test]
