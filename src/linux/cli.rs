@@ -54,11 +54,17 @@ pub fn intercept() -> Option<Result<()>> {
         "paste" => paste(args.get(1).map(PathBuf::from)),
         "doctor" => doctor(),
         "hyprland-snippet" => {
-            let key = daemon::hotkey().unwrap_or_else(|| "ALT + SHIFT + S".into());
+            // The daemon sees these (by their "Scrawl" description) and doesn't add its own.
             println!("-- ~/.config/hypr/bindings.lua");
-            println!("o.bind(\"{key}\", \"Scrawl: record / stop\", \"scrawl toggle\")");
-            println!("o.bind(\"ALT + SHIFT + V\", \"Scrawl: paste latest\", \"scrawl paste\")");
-            println!("o.bind(\"ALT + SHIFT + R\", \"Scrawl: review latest\", \"scrawl preview latest\")");
+            for (key, what, cmd) in [
+                (daemon::hotkey(), "record / stop", "scrawl toggle"),
+                (daemon::paste_hotkey(), "paste latest", "scrawl paste"),
+                (daemon::review_hotkey(), "review latest", "scrawl preview latest"),
+            ] {
+                if let Some(key) = key {
+                    println!("o.bind(\"{key}\", \"Scrawl: {what}\", \"{cmd}\")");
+                }
+            }
             Ok(())
         }
         "setup" if args.get(1).map(String::as_str) == Some("launcher") => setup_launcher(),

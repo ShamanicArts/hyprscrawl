@@ -27,9 +27,11 @@ without clicking anything, set `"linuxReviewOnFinish": true` in `~/.config/scraw
 
 The shortcuts are *runtime* Hyprland binds added by the daemon. No file is edited, and
 `hyprctl reload` removes them until the daemon adds them back. For permanent binds, run
-`scrawl hyprland-snippet` and paste its lines into `~/.config/hypr/bindings.lua`. To change or turn off
+`scrawl hyprland-snippet` and paste its lines into `~/.config/hypr/bindings.lua`; the daemon then
+leaves those chords to them instead of binding them a second time. To change or turn off
 a shortcut, set `linuxHotkey`, `linuxPasteHotkey` or `linuxReviewHotkey` (for example
-`"SUPER + SHIFT + R"`, or `"none"`) in `~/.config/scrawl/config.json`. A chord that something else
+`"SUPER + SHIFT + R"`, or `"none"`) in `~/.config/scrawl/config.json` and restart the daemon
+(`systemctl --user restart scrawl`): the old chord is switched off. A chord that something else
 already uses is left alone (see the log).
 
 Captures go to `~/.local/share/scrawl/captures/` (`SCRAWL_CAPTURES_DIR`). The log is at `~/.local/state/scrawl/scrawl.log`.

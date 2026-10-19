@@ -44,7 +44,7 @@ pub fn wait_for_modifiers_released(max_ms: u64) {
 return (d("Shift_L") or d("Shift_R") or d("Control_L") or d("Control_R") or d("Alt_L") or d("Alt_R") or d("Super_L") or d("Super_R")) and "held" or "free""#;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
     while std::time::Instant::now() < deadline {
-        match crate::linux::hypr::eval(lua) {
+        match crate::linux::hypr::eval_value(lua) {
             Ok(r) if r.contains("held") => std::thread::sleep(std::time::Duration::from_millis(15)),
             _ => return,
         }

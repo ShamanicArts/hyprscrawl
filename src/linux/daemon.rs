@@ -130,43 +130,108 @@ fn register_window_rule() {
     }
 }
 
-/// Adds Scrawl's shortcuts as runtime binds, each unless something else already owns its chord.
+/// Adds Scrawl's shortcuts as runtime binds and keeps them in line with the config. Every bind
+/// the daemon has made is kept (Hyprland can't safely remove binds) and known by its own chord,
+/// so a changed or turned-off shortcut switches the old chord off. A chord that something else
+/// owns is left to it: another app's bind, or another Scrawl bind such as a permanent one from
+/// `scrawl hyprland-snippet` (which would otherwise run every command twice).
 pub fn register_hotkey() {
     register_window_rule();
     let binds = hypr::json::<Vec<serde_json::Value>>("binds").unwrap_or_default();
     let exe = exe();
-    for (global, spec, command, description, setting) in [
+    let mut wants = String::new();
+    let mut listed = std::collections::BTreeMap::new();
+    let actions = [
         ("scrawl_hotkey", hotkey(), "toggle", "Scrawl: record / stop", "linuxHotkey"),
         ("scrawl_paste_hotkey", paste_hotkey(), "paste", "Scrawl: paste the latest capture", "linuxPasteHotkey"),
         ("scrawl_review_hotkey", review_hotkey(), "preview latest", "Scrawl: review the latest capture", "linuxReviewHotkey"),
-    ] {
+    ];
+    for (global, spec, command, description, setting) in &actions {
         let Some(spec) = spec else { continue };
-        let (mask, key) = parse_spec(&spec);
-        // Omarchy's binds are Lua too, so tell ours apart by description.
-        let taken = binds.iter().find(|b| {
-            b["modmask"].as_u64() == Some(mask)
-                && b["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(&key))
-                && b["submap"].as_str().unwrap_or("").is_empty()
-                && !b["description"].as_str().is_some_and(|d| d.starts_with("Scrawl"))
-        });
-        if let Some(b) = taken {
+        let (mask, key) = parse_spec(spec);
+        let chord = format!("{mask}:{}", key.to_ascii_uppercase());
+        let on_chord: Vec<&serde_json::Value> = binds
+            .iter()
+            .filter(|b| {
+                b["modmask"].as_u64() == Some(mask)
+                    && b["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(&key))
+                    && b["submap"].as_str().unwrap_or("").is_empty()
+            })
+            .collect();
+        let scrawl = |b: &&serde_json::Value| b["description"].as_str().is_some_and(|d| d.starts_with("Scrawl"));
+        if let Some(b) = on_chord.iter().find(|b| !scrawl(b)) {
             scrawl_log(format!(
                 "{spec} is already bound ({}); not adding \"{description}\". Set {setting} in ~/.config/scrawl/config.json.",
                 b["description"].as_str().unwrap_or("?")
             ));
             continue;
         }
-        let cmd = format!("{exe} {command}");
-        let lua = format!(
-            "if {global} == nil then {global} = hl.bind({}, hl.dsp.exec_cmd({}), {{ description = {} }}) end",
-            hypr::lua_str(&spec),
-            hypr::lua_str(&cmd),
+        listed.insert(chord.clone(), on_chord.iter().filter(|b| scrawl(b)).count());
+        wants.push_str(&format!(
+            "  {global} = {{ chord = {}, spec = {}, cmd = {}, desc = {} }},\n",
+            hypr::lua_str(&chord),
+            hypr::lua_str(spec),
+            hypr::lua_str(&format!("{exe} {command}")),
             hypr::lua_str(description)
-        );
-        match hypr::eval(&lua) {
-            Ok(_) => scrawl_log(format!("shortcut {spec} → {cmd}")),
-            Err(e) => scrawl_log(format!("could not add {spec}: {e:#}")),
+        ));
+    }
+    let listed: String = listed.iter().map(|(c, n)| format!("[{}] = {n}, ", hypr::lua_str(c))).collect();
+    let globals: String = actions.iter().map(|a| format!("\"{}\", ", a.0)).collect();
+    // `scrawl_owned[action]` lists every bind made for that action, each known by its real chord.
+    // Older daemons kept one handle in a global per action: adopted. First everything not wanted
+    // is switched off, then each wanted chord is switched on, unless another Scrawl bind that
+    // isn't ours (a permanent one) is on it.
+    let lua = format!(
+        r#"scrawl_owned = scrawl_owned or {{}}
+local function chord(h) return tostring(h.modmask) .. ":" .. string.upper(h.key) end
+for _, g in ipairs({{ {globals}}}) do
+  if _G[g] ~= nil then scrawl_owned[g] = scrawl_owned[g] or {{}}; table.insert(scrawl_owned[g], _G[g]); _G[g] = nil end
+end
+-- (A test build kept them per chord in scrawl_keys.)
+for g, slot in pairs(scrawl_keys or {{}}) do
+  scrawl_owned[g] = scrawl_owned[g] or {{}}
+  for _, h in pairs(slot) do table.insert(scrawl_owned[g], h) end
+end
+scrawl_keys = nil
+local wants = {{
+{wants}}}
+local listed = {{ {listed}}}
+local owned = {{}}
+for _, hs in pairs(scrawl_owned) do for _, h in ipairs(hs) do local c = chord(h); owned[c] = (owned[c] or 0) + 1 end end
+for g, hs in pairs(scrawl_owned) do
+  for _, h in ipairs(hs) do if not (wants[g] and wants[g].chord == chord(h)) then h:set_enabled(false) end end
+end
+local out, used = {{}}, {{}}
+for g, w in pairs(wants) do
+  local hs = scrawl_owned[g] or {{}}
+  scrawl_owned[g] = hs
+  if (listed[w.chord] or 0) > (owned[w.chord] or 0) or used[w.chord] then
+    for _, h in ipairs(hs) do h:set_enabled(false) end
+    table.insert(out, g .. "=taken")
+  else
+    local mine
+    for _, h in ipairs(hs) do if chord(h) == w.chord then mine = h end end
+    if mine then mine:set_enabled(true) else table.insert(hs, hl.bind(w.spec, hl.dsp.exec_cmd(w.cmd), {{ description = w.desc }})) end
+    used[w.chord] = true
+    table.insert(out, g .. "=on")
+  end
+end
+return table.concat(out, " ")"#
+    );
+    match hypr::eval_value(&lua) {
+        Ok(result) => {
+            for (global, spec, command, description, _) in &actions {
+                let Some(spec) = spec else { continue };
+                if result.split_whitespace().any(|r| r == format!("{global}=on")) {
+                    scrawl_log(format!("shortcut {spec} → {exe} {command}"));
+                } else if result.split_whitespace().any(|r| r == format!("{global}=taken")) {
+                    scrawl_log(format!(
+                        "{spec} already has a Scrawl bind (a permanent one?); not adding a second \"{description}\""
+                    ));
+                }
+            }
         }
+        Err(e) => scrawl_log(format!("could not set up the shortcuts: {e:#}")),
     }
 }
 
@@ -225,7 +290,7 @@ pub fn init_env() {
 fn current_mods() -> Mods {
     let lua = r#"local function d(k) local ok, r = pcall(hl.is_key_down, k); return (ok and r) and "1" or "0" end
 return d("Shift_L")..d("Shift_R").." "..d("Control_L")..d("Control_R").." "..d("Alt_L")..d("Alt_R").." "..d("Super_L")..d("Super_R")"#;
-    let r = hypr::eval(lua).unwrap_or_default();
+    let r = hypr::eval_value(lua).unwrap_or_default();
     let parts: Vec<&str> = r.split_whitespace().collect();
     let on = |i: usize| parts.get(i).is_some_and(|p| p.contains('1'));
     Mods {
@@ -554,7 +619,7 @@ fn held_past_tap() -> bool {
 return (d("Shift_L") or d("Shift_R") or d("Control_L") or d("Control_R") or d("Alt_L") or d("Alt_R") or d("Super_L") or d("Super_R")) and "held" or "free""#;
     let deadline = Instant::now() + Duration::from_millis(250);
     while Instant::now() < deadline {
-        match hypr::eval(lua) {
+        match hypr::eval_value(lua) {
             Ok(r) if r.contains("held") => std::thread::sleep(Duration::from_millis(15)),
             _ => return false,
         }
