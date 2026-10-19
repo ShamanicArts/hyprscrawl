@@ -5,7 +5,7 @@
 //! is needed. On start it registers the record shortcut as a runtime Hyprland bind (no file is
 //! edited; `hyprctl reload` drops it and the daemon adds it back).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -171,6 +171,8 @@ pub fn register_hotkey() {
 }
 
 struct Active {
+    /// Which recording this is, so a late watcher can't stop the next one.
+    id: u64,
     started: Instant,
     bundle_dir: PathBuf,
     target: TargetInfo,
@@ -183,8 +185,17 @@ struct Active {
 
 enum State {
     Idle,
+    /// `slurp` is up for an area or window; `slurp` is a pidfd for it once it has started, so a
+    /// cancel can't signal a reused pid after the picker was reaped.
+    Picking { id: u64, slurp: Option<std::os::fd::OwnedFd> },
     Recording(Box<Active>),
     Finishing,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 struct Daemon {
@@ -227,18 +238,23 @@ return d("Shift_L")..d("Shift_R").." "..d("Control_L")..d("Control_R").." "..d("
 
 impl Daemon {
     fn start(&self) -> Result<String> {
-        self.start_on(None)
+        self.start_on(None, None)
     }
 
-    fn start_on(&self, target: Option<TargetInfo>) -> Result<String> {
+    /// Starts recording `target` (the display under the cursor if `None`). `pick` is the pick this
+    /// target came from: it starts only if that pick is still the current state (not cancelled).
+    fn start_on(&self, target: Option<TargetInfo>, pick: Option<u64>) -> Result<String> {
         let mut state = self.state.lock().unwrap();
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok("shutting down".into());
         }
-        match &*state {
-            State::Recording(_) => return Ok("already recording".into()),
-            State::Finishing => return Ok("still finishing the last capture".into()),
-            State::Idle => {}
+        match (&*state, pick) {
+            (State::Idle, None) => {}
+            (State::Picking { id, .. }, Some(pick)) if *id == pick => *state = State::Idle,
+            (_, Some(_)) => return Ok("cancelled".into()),
+            (State::Picking { .. }, None) => return Ok("picking an area or window".into()),
+            (State::Recording(_), None) => return Ok("already recording".into()),
+            (State::Finishing, None) => return Ok("still finishing the last capture".into()),
         }
         let target = target.unwrap_or_else(|| crate::capture::discover_target(None));
         let dir = captures_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
@@ -294,6 +310,7 @@ impl Daemon {
         });
         scrawl_log(format!("recording {} into {}", target_label(&target), dir.display()));
         *state = State::Recording(Box::new(Active {
+            id: next_id(),
             started,
             bundle_dir: dir,
             target,
@@ -306,14 +323,20 @@ impl Daemon {
         Ok("recording".into())
     }
 
-    /// Stops the recording and builds the bundle (on the calling thread).
-    fn stop(self: &Arc<Self>, reason: &str) -> Result<String> {
+    /// Stops the recording and builds the bundle (on the calling thread). `asked` is when the
+    /// request arrived (the start holds the state lock while the recorder comes up, so a press
+    /// can wait here past the tap window). `only` stops nothing unless that recording is current.
+    fn stop(self: &Arc<Self>, reason: &str, asked: Instant, only: Option<u64>) -> Result<String> {
         let active = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, State::Finishing) {
+                State::Recording(a) if only.is_some_and(|id| id != a.id) => {
+                    *state = State::Recording(a);
+                    return Ok("not recording".into());
+                }
                 State::Recording(a) => {
                     // Like upstream: a press within 400 ms of the start is the same tap.
-                    if a.started.elapsed() < Duration::from_millis(400) && reason == "toggle" {
+                    if reason == "toggle" && asked.saturating_duration_since(a.started) < Duration::from_millis(400) {
                         *state = State::Recording(a);
                         return Ok("recording".into());
                     }
@@ -330,12 +353,19 @@ impl Daemon {
         result
     }
 
-    /// Esc while recording, like upstream: stop everything and keep nothing.
+    /// Esc while recording, like upstream: stop everything and keep nothing. Also closes a picker.
     fn cancel(&self) -> Result<String> {
         let a = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, State::Finishing) {
                 State::Recording(a) => a,
+                State::Picking { slurp, .. } => {
+                    *state = State::Idle;
+                    if let Some(fd) = slurp {
+                        signal_pidfd(&fd, libc::SIGTERM);
+                    }
+                    return Ok("cancelled".into());
+                }
                 other => {
                     *state = other;
                     return Ok("not recording".into());
@@ -448,14 +478,17 @@ impl Daemon {
         // either completes before this loop sees it (and is finished below) or never begins.
         self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
         loop {
-            let finishing = match &*self.state.lock().unwrap() {
+            let (finishing, picking) = match &*self.state.lock().unwrap() {
                 State::Idle => break,
-                State::Recording(_) => false,
-                State::Finishing => true,
+                State::Picking { .. } => (false, true),
+                State::Recording(_) => (false, false),
+                State::Finishing => (true, false),
             };
             if finishing {
                 std::thread::sleep(Duration::from_millis(100));
-            } else if let Err(e) = self.stop(reason) {
+            } else if picking {
+                let _ = self.cancel();
+            } else if let Err(e) = self.stop(reason, Instant::now(), None) {
                 scrawl_log(format!("finishing on {reason}: {e:#}"));
             }
         }
@@ -469,8 +502,47 @@ impl Daemon {
     fn status(&self) -> String {
         match &*self.state.lock().unwrap() {
             State::Idle => "idle".into(),
+            State::Picking { .. } => "picking".into(),
             State::Recording(a) => format!("recording {} s", a.started.elapsed().as_secs()),
             State::Finishing => "finishing".into(),
+        }
+    }
+}
+
+impl Daemon {
+    /// Puts up the picker and records what is chosen. Only from Idle; `cancel` (Esc, `scrawl
+    /// cancel`) and shutdown close the picker, and a pick that was cancelled never starts.
+    fn pick(&self) -> Result<String> {
+        let id = next_id();
+        {
+            let mut state = self.state.lock().unwrap();
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok("shutting down".into());
+            }
+            match &*state {
+                State::Idle => *state = State::Picking { id, slurp: None },
+                State::Picking { .. } => return Ok("already picking".into()),
+                State::Recording(_) => return Ok("already recording".into()),
+                State::Finishing => return Ok("still finishing the last capture".into()),
+            }
+        }
+        let picked = pick_target(|pid| match &mut *self.state.lock().unwrap() {
+            State::Picking { id: current, slurp } if *current == id => {
+                // Opened before anything can reap the child, so it names this slurp for good.
+                *slurp = pidfd_open(pid);
+                true
+            }
+            _ => false,
+        });
+        match picked {
+            Some(target) => self.start_on(Some(target), Some(id)),
+            None => {
+                let mut state = self.state.lock().unwrap();
+                if matches!(&*state, State::Picking { id: current, .. } if *current == id) {
+                    *state = State::Idle;
+                }
+                Ok("cancelled".into())
+            }
         }
     }
 }
@@ -491,8 +563,9 @@ return (d("Shift_L") or d("Shift_R") or d("Control_L") or d("Control_R") or d("A
 }
 
 /// `slurp` over the visible windows: drag for an area, click a window for that window, Esc
-/// cancels. (Omarchy's own region capture uses slurp too.)
-pub fn pick_target() -> Option<TargetInfo> {
+/// cancels. (Omarchy's own region capture uses slurp too.) `started(pid)` hands over the picker's
+/// pid; when it says no (the pick was cancelled meanwhile) the picker is closed at once.
+fn pick_target(started: impl FnOnce(u32) -> bool) -> Option<TargetInfo> {
     let windows = hypr::visible_clients().unwrap_or_default();
     let boxes: String = windows
         .iter()
@@ -512,12 +585,27 @@ pub fn pick_target() -> Option<TargetInfo> {
         .spawn()
         .inspect_err(|e| scrawl_log(format!("slurp: {e}")))
         .ok()?;
-    child.stdin.take()?.write_all(boxes.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
+    // From here every path reaps the child.
+    let wanted = started(child.id());
+    let written = wanted
+        && child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(boxes.as_bytes()).is_ok());
+    if !written {
+        let _ = child.kill();
+        let _ = child.wait();
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&stdout);
     let f: Vec<&str> = text.split_whitespace().collect();
     let num = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok());
     let (x, y, w, h) = (num(0)?, num(1)?, num(2)?, num(3)?);
@@ -533,6 +621,20 @@ pub fn pick_target() -> Option<TargetInfo> {
         Some(c) => crate::capture::discover_target_window(c),
         None => crate::capture::region_target(x, y, w, h),
     })
+}
+
+fn pidfd_open(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Signals the process behind a pidfd; nothing happens if it has already gone.
+fn signal_pidfd(fd: &std::os::fd::OwnedFd, sig: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0);
+    }
 }
 
 fn target_label(t: &TargetInfo) -> String {
@@ -642,10 +744,13 @@ pub fn run(record_now: bool) -> Result<()> {
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(500));
-            let stopped_outside = matches!(&*d.state.lock().unwrap(), State::Recording(a) if !a.session.is_recording());
-            if stopped_outside {
+            let stopped_outside = match &*d.state.lock().unwrap() {
+                State::Recording(a) if !a.session.is_recording() => Some(a.id),
+                _ => None,
+            };
+            if let Some(id) = stopped_outside {
                 scrawl_log("gpu-screen-recorder stopped from outside; finishing the capture");
-                let _ = d.stop("stopped outside");
+                let _ = d.stop("stopped outside", Instant::now(), Some(id));
             }
         });
     }
@@ -668,28 +773,23 @@ pub fn run(record_now: bool) -> Result<()> {
 fn serve(d: &Arc<Daemon>, conn: UnixStream) -> Result<()> {
     let mut line = String::new();
     BufReader::new(conn.try_clone()?).read_line(&mut line)?;
+    let asked = Instant::now();
     let cmd = line.trim();
     let reply = match cmd {
         "toggle" => {
             let recording = matches!(&*d.state.lock().unwrap(), State::Recording(_));
             if recording {
-                d.stop("toggle")
+                d.stop("toggle", asked, None)
             } else if held_past_tap() {
                 // Held like upstream's switcher: pick an area or a window.
-                match pick_target() {
-                    Some(t) => d.start_on(Some(t)),
-                    None => Ok("cancelled".into()),
-                }
+                d.pick()
             } else {
                 d.start()
             }
         }
-        "pick" => match pick_target() {
-            Some(t) => d.start_on(Some(t)),
-            None => Ok("cancelled".into()),
-        },
+        "pick" => d.pick(),
         "start" => d.start(),
-        "stop" => d.stop("stop"),
+        "stop" => d.stop("stop", asked, None),
         "cancel" => d.cancel(),
         "status" => Ok(d.status()),
         "last" => Ok(d
@@ -755,6 +855,10 @@ pub fn send(cmd: &str, spawn: bool) -> Result<String> {
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim();
+    if reply.is_empty() {
+        // `quit` (or a stop signal) ended the daemon while this command waited, e.g. a picker.
+        bail!("the scrawl daemon exited before answering");
+    }
     if let Some(r) = reply.strip_prefix("ok ") {
         Ok(r.to_owned())
     } else {

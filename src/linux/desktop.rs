@@ -19,9 +19,10 @@ fn wl_copy(mime: &str, bytes: &[u8]) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("Could not run wl-copy (install wl-clipboard)")?;
-    child.stdin.take().context("wl-copy stdin")?.write_all(bytes)?;
+    let written = child.stdin.take().context("wl-copy stdin").and_then(|mut stdin| Ok(stdin.write_all(bytes)?));
     // wl-copy forks to serve the selection; the parent exits once it has the data.
     let status = child.wait()?;
+    written?;
     if !status.success() {
         bail!("wl-copy failed");
     }
@@ -156,11 +157,14 @@ pub fn notify_simple(title: &str, body: &str) -> Option<u32> {
 
 /// Omarchy's bar polls `pgrep ^gpu-screen-recorder`; ask it to look now.
 pub fn refresh_indicators() {
-    if has("omarchy-shell") {
-        let _ = Command::new("omarchy-shell")
+    if has("omarchy-shell")
+        && let Ok(mut child) = Command::new("omarchy-shell")
             .args(["-q", "omarchy.indicators", "refresh"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .spawn()
+    {
+        // Reaped off the caller's thread: the daemon lives long and would collect zombies.
+        std::thread::spawn(move || child.wait());
     }
 }
