@@ -20,6 +20,13 @@ pub fn cli() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SCRAWL_WHISPER_CLI") {
         return Some(PathBuf::from(p));
     }
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("whisper-cli")))
+        .filter(|p| p.is_file())
+    {
+        return Some(beside);
+    }
     let local = data_dir().join("bin/whisper-cli");
     if local.is_file() {
         return Some(local);
