@@ -296,12 +296,24 @@ impl Render for ReviewWindow {
                                 hint_button("btn-record", "Record", crate::linux::daemon::hotkey(), false).on_click(
                                     cx.listener(|this, _, window, cx| {
                                         crate::capture::scrawl_log("review: Record");
-                                        this.status = Some("Recording…".into());
-                                        cx.notify();
-                                        std::thread::spawn(|| {
-                                            let _ = crate::linux::daemon::send("start", true);
+                                        // Its own process: this one quits as soon as its last
+                                        // window closes, which a thread here wouldn't survive.
+                                        let started = std::env::current_exe().and_then(|exe| {
+                                            std::process::Command::new(exe)
+                                                .arg("start")
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::null())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
                                         });
-                                        window.remove_window();
+                                        match started {
+                                            Ok(_) => window.remove_window(),
+                                            Err(e) => {
+                                                crate::capture::scrawl_log(format!("review: could not start recording: {e}"));
+                                                this.status = Some("Couldn't start recording".into());
+                                                cx.notify();
+                                            }
+                                        }
                                     }),
                                 ),
                             )
