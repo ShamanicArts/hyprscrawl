@@ -360,7 +360,7 @@ fn run(
         let (strokes, live) = telemetry.ink_snapshot();
         let fading: Vec<(&Stroke, f32)> = strokes
             .iter()
-            .filter_map(|s| fade_alpha(now_ms.saturating_sub(s.t1)).map(|a| (s, a)))
+            .filter_map(|(s, released)| fade_alpha(now_ms.saturating_sub(*released)).map(|a| (s, a)))
             .collect();
         // Keep drawing while a stroke fades, and once more after the last one has gone.
         let animating = !fading.is_empty() || was_fading;
