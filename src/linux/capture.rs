@@ -398,6 +398,15 @@ impl ScreenCaptureSession {
         self.started_at.elapsed().as_millis() as u64
     }
 
+    /// Stops the recorder and keeps nothing (a cancelled capture).
+    pub fn discard(mut self) {
+        if let Some(rec) = self.recorder.take()
+            && let Err(e) = rec.stop()
+        {
+            scrawl_log(format!("gpu-screen-recorder stop: {e:#}"));
+        }
+    }
+
     pub fn stop(self) -> ScreenRecording {
         self.stop_with(|_, _| {})
     }

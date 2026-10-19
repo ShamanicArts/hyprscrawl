@@ -107,8 +107,11 @@ pub fn notify(n: Notice) -> Option<u32> {
         return None;
     }
     if has("omarchy-notification-send") {
+        // Sent as Omarchy's default "omarchy-action", the app name for confirmations of something
+        // the user just did ("Screenshot saved"): those are the toasts Do Not Disturb lets through,
+        // and every Scrawl notice answers a key the user just pressed.
         let mut cmd = Command::new("omarchy-notification-send");
-        cmd.args(["--app-name", "Scrawl", "-p"]);
+        cmd.arg("-p");
         if n.critical {
             cmd.args(["-u", "critical"]);
         }

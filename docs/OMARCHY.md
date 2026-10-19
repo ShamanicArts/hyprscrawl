@@ -11,16 +11,26 @@ Setup needs no root, no `input` group, no Hyprland plugin and no edits to your c
 |---|---|
 | **Alt+Shift+S** (tap) | Record the screen under the pointer. A red edge glow flashes as the start cue. Tap again to finish. |
 | **Alt+Shift+S** (hold) | Pick what to record: drag an area, or click a window. Esc cancels. |
-| **Hold Shift + move** | Draw red ink while recording. Clicks still go to your apps. |
-| Finish | The bundle is built (transcript, keyframes, contact sheet) and its summary is copied to the clipboard. The notification opens the review window. |
-| `scrawl paste` | Paste the latest capture (contact sheet, then summary) into the focused window. |
-| `scrawl preview [latest]` | Review window: contact sheet / keyframes, transcript and timeline. |
-| `scrawl doctor` | Lists what is missing and how to install it. |
+| **Hold Shift + move** | Draw red ink while recording. A stroke fades from the screen 1.3 s after you let go (the bundle keeps it). Clicks still go to your apps. |
+| **Ctrl+Z** | Undo the last stroke while recording. |
+| **Esc** | Cancel the recording; nothing is saved. Esc is only taken while recording. |
+| Finish | The bundle is built (transcript, keyframes, contact sheet) and its summary is copied to the clipboard. A "Scrawl saved" notification shows the contact sheet. |
+| **Alt+Shift+R** | Open the latest capture in the review window: contact sheet / keyframes, transcript and timeline. Clicking the "saved" notification does the same. |
+| **Alt+Shift+V** | Paste the latest capture (contact sheet, then summary) into the focused window. |
+| `scrawl preview [latest\|BUNDLE]` | The review window from a terminal. |
+| `scrawl setup launcher` | Adds "Scrawl: Review Latest Capture" and "Scrawl: Record" to the app launcher (Super+Space). |
+| `scrawl doctor` | Lists what is missing and how to install it, and the shortcuts in use. |
 
-The shortcut is a *runtime* Hyprland bind added by the daemon. No file is edited, and `hyprctl reload` removes it
-until the daemon adds it back. For a permanent bind, run `scrawl hyprland-snippet` and paste its line into
-`~/.config/hypr/bindings.lua`. To change or disable the shortcut, set `"linuxHotkey": "SUPER + SHIFT + R"` or
-`"none"` in `~/.config/scrawl/config.json`, or use `SCRAWL_HOTKEY`.
+Scrawl's notifications go through Omarchy as user-action confirmations (like "Screenshot saved"),
+so they still show while Do Not Disturb is on. To open each finished capture's review window
+without clicking anything, set `"linuxReviewOnFinish": true` in `~/.config/scrawl/config.json`.
+
+The shortcuts are *runtime* Hyprland binds added by the daemon. No file is edited, and
+`hyprctl reload` removes them until the daemon adds them back. For permanent binds, run
+`scrawl hyprland-snippet` and paste its lines into `~/.config/hypr/bindings.lua`. To change or turn off
+a shortcut, set `linuxHotkey`, `linuxPasteHotkey` or `linuxReviewHotkey` (for example
+`"SUPER + SHIFT + R"`, or `"none"`) in `~/.config/scrawl/config.json`. A chord that something else
+already uses is left alone (see the log).
 
 Captures go to `~/.local/share/scrawl/captures/` (`SCRAWL_CAPTURES_DIR`). The log is at `~/.local/state/scrawl/scrawl.log`.
 
@@ -78,6 +88,9 @@ binary is used first.
 - Sparkle updates.
 - Video export rendering (`scrawl export` builds the plan, but its renderer is the AVFoundation helper).
 - Multi-MIME clipboard. The text summary is copied; `scrawl paste` pastes image then text.
+- The capsule ("island") with its mode switcher and Paste / Inspect chips: notifications and the
+  shortcuts above stand in for it.
+- Sending dev-site captures to their OpenCode session.
 
 ## Following upstream
 

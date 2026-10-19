@@ -349,13 +349,22 @@ fn run(
     let started = Instant::now();
     let mut last_gen = u64::MAX;
     let mut glow_done = false;
+    let mut was_fading = false;
     let mut pixmap = tiny_skia::Pixmap::new(bw, bh).context("pixmap")?;
     while !stop.load(Ordering::Acquire) && !st.closed {
         pump(&conn, &mut q, &mut st)?;
         let generation = telemetry.ink_generation.load(Ordering::Acquire);
         let glow_t = started.elapsed().as_millis() as u64;
         let glowing = glow_t < GLOW_MS;
-        if generation != last_gen || glowing || !glow_done {
+        let now_ms = telemetry.t_of_mono(crate::capture::mono_us());
+        let (strokes, live) = telemetry.ink_snapshot();
+        let fading: Vec<(&Stroke, f32)> = strokes
+            .iter()
+            .filter_map(|s| fade_alpha(now_ms.saturating_sub(s.t1)).map(|a| (s, a)))
+            .collect();
+        // Keep drawing while a stroke fades, and once more after the last one has gone.
+        let animating = !fading.is_empty() || was_fading;
+        if generation != last_gen || glowing || !glow_done || animating {
             let Some(i) = (0..2).find(|&i| !st.busy[i]) else {
                 std::thread::sleep(Duration::from_millis(4));
                 continue;
@@ -364,9 +373,8 @@ fn run(
             if glowing {
                 draw_glow(&mut pixmap, 1.0 - glow_t as f32 / GLOW_MS as f32, px_per_lp);
             }
-            let (strokes, live) = telemetry.ink_snapshot();
-            for s in strokes.iter().chain(live.iter()) {
-                draw_stroke(&mut pixmap, s, size, &to_px);
+            for (s, alpha) in fading.iter().copied().chain(live.iter().map(|s| (s, 1.0))) {
+                draw_stroke(&mut pixmap, s, size, alpha, &to_px);
             }
             let dst = unsafe { std::slice::from_raw_parts_mut(map.ptr.add(i * frame_len), frame_len) };
             for (d, s) in dst.chunks_exact_mut(4).zip(pixmap.data().chunks_exact(4)) {
@@ -382,6 +390,7 @@ fn run(
             st.busy[i] = true;
             last_gen = generation;
             glow_done = !glowing;
+            was_fading = !fading.is_empty();
         }
         std::thread::sleep(Duration::from_millis(12));
     }
@@ -403,7 +412,20 @@ fn paint(color: [u8; 4]) -> tiny_skia::Paint<'static> {
     p
 }
 
-fn draw_stroke(pm: &mut tiny_skia::Pixmap, s: &Stroke, size: f32, to_px: &impl Fn(f32, f32) -> [f32; 2]) {
+/// Upstream's live-ink fade: a finished stroke holds for 650 ms, then fades out over 650 ms
+/// (quadratic). `None` once it has gone. The bundle keeps every stroke; only the screen lets go.
+fn fade_alpha(age_ms: u64) -> Option<f32> {
+    match age_ms {
+        0..=650 => Some(1.0),
+        651..=1_299 => {
+            let t = (age_ms - 650) as f32 / 650.0;
+            Some((1.0 - t) * (1.0 - t))
+        }
+        _ => None,
+    }
+}
+
+fn draw_stroke(pm: &mut tiny_skia::Pixmap, s: &Stroke, size: f32, alpha: f32, to_px: &impl Fn(f32, f32) -> [f32; 2]) {
     if s.laser {
         return;
     }
@@ -427,7 +449,9 @@ fn draw_stroke(pm: &mut tiny_skia::Pixmap, s: &Stroke, size: f32, to_px: &impl F
     }
     pb.close();
     if let Some(path) = pb.finish() {
-        pm.fill_path(&path, &paint(RED), tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+        let [r, g, b, a] = RED;
+        let color = [r, g, b, (f32::from(a) * alpha).round() as u8];
+        pm.fill_path(&path, &paint(color), tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
     }
 }
 
@@ -466,5 +490,18 @@ fn draw_glow(pm: &mut tiny_skia::Pixmap, strength: f32, scale: f32) {
             ..Default::default()
         };
         pm.fill_rect(rect, &p, tiny_skia::Transform::identity(), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fade_alpha;
+
+    #[test]
+    fn ink_holds_then_fades_like_upstream() {
+        assert_eq!(fade_alpha(0), Some(1.0));
+        assert_eq!(fade_alpha(650), Some(1.0));
+        assert!((fade_alpha(975).unwrap() - 0.25).abs() < 0.01);
+        assert_eq!(fade_alpha(1_300), None);
     }
 }

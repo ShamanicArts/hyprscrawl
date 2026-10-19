@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::capture::{Mods, SharedCaptureTelemetry, mono_us, scrawl_log};
+use crate::capture::{LiveOverlayEvent, Mods, SharedCaptureTelemetry, mono_us, scrawl_log};
 
 pub fn log_path() -> PathBuf {
     crate::linux::gsr::runtime_dir().join("events.log")
@@ -32,6 +32,8 @@ const SHIFT: [u32; 2] = [50, 62];
 const CTRL: [u32; 2] = [37, 105];
 const ALT: [u32; 2] = [64, 108];
 const LOGO: [u32; 2] = [133, 134];
+/// xkb keycode of the key in Z's place.
+const KEY_Z: u32 = 52;
 
 fn inject_lua(path: &str) -> String {
     let p = crate::linux::hypr::lua_str(path);
@@ -63,6 +65,11 @@ if scrawl_obs == nil then
   end
 end
 local o = scrawl_obs
+if o.esc == nil then
+  -- Upstream's Esc: cancels the recording, and (unlike the observers) is consumed while recording.
+  o.esc = hl.bind("Escape", function() if o.on and o.f then o.f:write("X esc\n") end end, {{ submap_universal = true, description = "Scrawl: cancel the recording" }})
+  table.insert(o.binds, o.esc)
+end
 if o.f then pcall(function() o.f:close() end) end
 o.f = opened({p})
 o.mods = {{}}
@@ -196,11 +203,18 @@ fn tail(file: std::fs::File, telemetry: &SharedCaptureTelemetry, stop: &AtomicBo
                     mods.alt = down;
                 } else if LOGO.contains(&code) {
                     mods.logo = down;
+                } else if down && code == KEY_Z && mods.ctrl && !mods.alt && !mods.shift && !mods.logo {
+                    // Upstream's ⌘Z: undo the last stroke (the app gets the key too).
+                    let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
+                    continue;
                 } else if down {
                     telemetry.key_down(t, code.saturating_sub(8));
                     continue;
                 }
                 telemetry.set_mods(mods);
+            }
+            ["X", "esc"] => {
+                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::CancelCapture);
             }
             ["B", btn, edge, x, y] => {
                 let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) else {

@@ -21,17 +21,80 @@ pub fn socket_path() -> PathBuf {
     gsr::runtime_dir().join("daemon.sock")
 }
 
-/// The record shortcut, as a Hyprland key spec.
-pub fn hotkey() -> Option<String> {
-    let v = std::env::var("SCRAWL_HOTKEY").ok().or_else(|| {
+/// A shortcut as a Hyprland key spec: `env`, else `key` in the config, else `default`;
+/// "none" turns it off.
+fn shortcut(env: &str, key: &str, default: &str) -> Option<String> {
+    let v = std::env::var(env).ok().or_else(|| {
         let raw = std::fs::read(crate::handoff::default_config_path()).ok()?;
         let cfg: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-        cfg.get("linuxHotkey")?.as_str().map(str::to_owned)
+        cfg.get(key)?.as_str().map(str::to_owned)
     });
     match v.as_deref() {
         Some("" | "none" | "off") => None,
         Some(s) => Some(s.to_owned()),
-        None => Some("ALT + SHIFT + S".to_owned()),
+        None => Some(default.to_owned()),
+    }
+}
+
+/// Record / stop (upstream's ⌥⇧S).
+pub fn hotkey() -> Option<String> {
+    shortcut("SCRAWL_HOTKEY", "linuxHotkey", "ALT + SHIFT + S")
+}
+
+/// Paste the latest capture (upstream's ⌥⇧V).
+pub fn paste_hotkey() -> Option<String> {
+    shortcut("SCRAWL_PASTE_HOTKEY", "linuxPasteHotkey", "ALT + SHIFT + V")
+}
+
+/// Open the latest capture in the review window (upstream's Inspect chip and Open Latest Capture).
+pub fn review_hotkey() -> Option<String> {
+    shortcut("SCRAWL_REVIEW_HOTKEY", "linuxReviewHotkey", "ALT + SHIFT + R")
+}
+
+/// Whether a finished capture opens its review window by itself (`"linuxReviewOnFinish": true`).
+pub fn review_on_finish() -> bool {
+    std::env::var("SCRAWL_REVIEW_ON_FINISH").ok().map_or_else(
+        || {
+            std::fs::read(crate::handoff::default_config_path())
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+                .and_then(|cfg| cfg.get("linuxReviewOnFinish")?.as_bool())
+                .unwrap_or(false)
+        },
+        |v| v == "1" || v.eq_ignore_ascii_case("true"),
+    )
+}
+
+/// "ALT + SHIFT + R" → "Alt+Shift+R".
+pub fn pretty_key(spec: &str) -> String {
+    spec.split('+')
+        .map(|part| {
+            let part = part.trim();
+            match part.to_ascii_uppercase().as_str() {
+                "ALT" => "Alt".into(),
+                "SHIFT" => "Shift".into(),
+                "CTRL" | "CONTROL" => "Ctrl".into(),
+                "SUPER" | "MOD4" | "WIN" => "Super".into(),
+                _ => part.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Opens `dir` in the review window as its own process.
+fn open_review(dir: &Path) {
+    match std::process::Command::new(exe())
+        .arg("preview")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // Reap it when it closes.
+        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+        Err(e) => scrawl_log(format!("could not open the review window: {e:#}")),
     }
 }
 
@@ -58,9 +121,8 @@ fn parse_spec(spec: &str) -> (u64, String) {
     (mask, key)
 }
 
-/// Adds the record shortcut as a runtime bind unless something else already owns that chord.
 /// The review window floats like upstream's panel instead of being tiled. A runtime rule, like the
-/// shortcut: nothing is written to the user's config, and a reload drops it until it is added back.
+/// shortcuts: nothing is written to the user's config, and a reload drops it until it is added back.
 fn register_window_rule() {
     let lua = r#"if scrawl_review_rule == nil then scrawl_review_rule = hl.window_rule({ name = "scrawl-review", match = { class = "dev.scrawl.Scrawl" }, float = true, center = true, size = "1120 740" }) end"#;
     if let Err(e) = hypr::eval(lua) {
@@ -68,34 +130,43 @@ fn register_window_rule() {
     }
 }
 
+/// Adds Scrawl's shortcuts as runtime binds, each unless something else already owns its chord.
 pub fn register_hotkey() {
     register_window_rule();
-    let Some(spec) = hotkey() else { return };
-    let (mask, key) = parse_spec(&spec);
-    if let Ok(binds) = hypr::json::<Vec<serde_json::Value>>("binds") {
+    let binds = hypr::json::<Vec<serde_json::Value>>("binds").unwrap_or_default();
+    let exe = exe();
+    for (global, spec, command, description, setting) in [
+        ("scrawl_hotkey", hotkey(), "toggle", "Scrawl: record / stop", "linuxHotkey"),
+        ("scrawl_paste_hotkey", paste_hotkey(), "paste", "Scrawl: paste the latest capture", "linuxPasteHotkey"),
+        ("scrawl_review_hotkey", review_hotkey(), "preview latest", "Scrawl: review the latest capture", "linuxReviewHotkey"),
+    ] {
+        let Some(spec) = spec else { continue };
+        let (mask, key) = parse_spec(&spec);
+        // Omarchy's binds are Lua too, so tell ours apart by description.
         let taken = binds.iter().find(|b| {
             b["modmask"].as_u64() == Some(mask)
                 && b["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(&key))
-                && !b["arg"].as_str().is_some_and(|a| a.contains("scrawl"))
-                && b["dispatcher"].as_str() != Some("__lua")
+                && b["submap"].as_str().unwrap_or("").is_empty()
+                && !b["description"].as_str().is_some_and(|d| d.starts_with("Scrawl"))
         });
         if let Some(b) = taken {
             scrawl_log(format!(
-                "{spec} is already bound ({} {}); not adding Scrawl's shortcut. Set linuxHotkey in ~/.config/scrawl/config.json or SCRAWL_HOTKEY.",
-                b["dispatcher"], b["arg"]
+                "{spec} is already bound ({}); not adding \"{description}\". Set {setting} in ~/.config/scrawl/config.json.",
+                b["description"].as_str().unwrap_or("?")
             ));
-            return;
+            continue;
         }
-    }
-    let cmd = format!("{} toggle", exe());
-    let lua = format!(
-        "if scrawl_hotkey == nil then scrawl_hotkey = hl.bind({}, hl.dsp.exec_cmd({}), {{ description = \"Scrawl: record / stop\" }}) end",
-        hypr::lua_str(&spec),
-        hypr::lua_str(&cmd)
-    );
-    match hypr::eval(&lua) {
-        Ok(_) => scrawl_log(format!("shortcut {spec} → {cmd}")),
-        Err(e) => scrawl_log(format!("could not add the shortcut: {e:#}")),
+        let cmd = format!("{exe} {command}");
+        let lua = format!(
+            "if {global} == nil then {global} = hl.bind({}, hl.dsp.exec_cmd({}), {{ description = {} }}) end",
+            hypr::lua_str(&spec),
+            hypr::lua_str(&cmd),
+            hypr::lua_str(description)
+        );
+        match hypr::eval(&lua) {
+            Ok(_) => scrawl_log(format!("shortcut {spec} → {cmd}")),
+            Err(e) => scrawl_log(format!("could not add {spec}: {e:#}")),
+        }
     }
 }
 
@@ -201,10 +272,10 @@ impl Daemon {
         let overlay = crate::linux::overlay::Overlay::start(Arc::clone(&self.telemetry), &target)
             .inspect_err(|e| scrawl_log(format!("overlay unavailable: {e:#}")))
             .ok();
-        let key = hotkey().unwrap_or_else(|| "scrawl toggle".into());
+        let key = hotkey().map_or_else(|| "scrawl toggle".into(), |k| pretty_key(&k));
         let notice = desktop::notify(desktop::Notice {
             title: "Scrawl is recording",
-            body: &format!("Talk, click, hold Shift and move to draw. {key} to finish."),
+            body: &format!("Talk, click, hold Shift and move to draw (Ctrl+Z undoes a stroke). {key} to finish, Esc to cancel."),
             image: None,
             on_click: None,
             replaces: None,
@@ -246,6 +317,40 @@ impl Daemon {
         let result = self.finish(*active, reason);
         *self.state.lock().unwrap() = State::Idle;
         result
+    }
+
+    /// Esc while recording, like upstream: stop everything and keep nothing.
+    fn cancel(&self) -> Result<String> {
+        let a = {
+            let mut state = self.state.lock().unwrap();
+            match std::mem::replace(&mut *state, State::Finishing) {
+                State::Recording(a) => a,
+                other => {
+                    *state = other;
+                    return Ok("not recording".into());
+                }
+            }
+        };
+        a.source.stop();
+        let _ = self.telemetry.finish_session();
+        if let Some(o) = a.overlay {
+            o.stop();
+        }
+        a.session.discard();
+        let _ = a.window_log.stop();
+        desktop::refresh_indicators();
+        let _ = std::fs::remove_dir_all(&a.bundle_dir);
+        scrawl_log("cancelled: recording discarded");
+        desktop::notify(desktop::Notice {
+            title: "Scrawl cancelled",
+            body: "Esc stopped the recording. Nothing was saved.",
+            image: None,
+            on_click: None,
+            replaces: a.notice,
+            critical: false,
+        });
+        *self.state.lock().unwrap() = State::Idle;
+        Ok("cancelled".into())
     }
 
     fn finish(&self, a: Active, reason: &str) -> Result<String> {
@@ -305,18 +410,22 @@ impl Daemon {
         let copied = std::env::var_os("SCRAWL_NO_CLIPBOARD").is_none() && desktop::copy_text(&summary).is_ok();
         let sheet = dir.join(&bundle.contact_sheet);
         desktop::notify(desktop::Notice {
-            title: if copied { "Scrawl saved · copied" } else { "Scrawl saved" },
+            title: if copied { "Scrawl saved · summary copied" } else { "Scrawl saved" },
             body: &format!(
-                "{} keyframes, {} s. {}",
+                "{} keyframes, {} s. Click to review{}{}.",
                 bundle.keyframes.len(),
                 bundle.duration_ms / 1000,
-                if copied { "Paste it into your agent." } else { "" }
+                review_hotkey().map_or(String::new(), |k| format!(" ({} any time)", pretty_key(&k))),
+                paste_hotkey().map_or(String::new(), |k| format!(" · {} pastes sheet + summary", pretty_key(&k))),
             ),
             image: sheet.is_file().then_some(sheet.as_path()),
             on_click: Some(vec![exe(), "preview".into(), dir.display().to_string()]),
             replaces: processing,
             critical: false,
         });
+        if review_on_finish() {
+            open_review(&dir);
+        }
         scrawl_log(format!("saved {}", dir.display()));
         Ok(dir.display().to_string())
     }
@@ -410,12 +519,29 @@ pub fn run(record_now: bool) -> Result<()> {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    let (tx, _rx) = flume::unbounded();
+    let (tx, rx) = flume::unbounded();
     let daemon = Arc::new(Daemon {
         state: Mutex::new(State::Idle),
         telemetry: SharedCaptureTelemetry::new(tx),
         last_bundle: Mutex::new(None),
     });
+    {
+        // Esc and Ctrl+Z from the input source.
+        let d = Arc::clone(&daemon);
+        std::thread::Builder::new().name("scrawl-ui-events".into()).spawn(move || {
+            for event in rx.iter() {
+                match event {
+                    crate::capture::LiveOverlayEvent::CancelCapture => {
+                        let d = Arc::clone(&d);
+                        // Not on this thread: stopping the input source waits for its threads.
+                        std::thread::spawn(move || d.cancel());
+                    }
+                    crate::capture::LiveOverlayEvent::UndoStroke => d.telemetry.undo_stroke(),
+                    _ => {}
+                }
+            }
+        })?;
+    }
     register_hotkey();
     // Upstream's cleanup: heavy media to the Trash after `mediaDays`, bundles after `bundleDays`.
     crate::retention::start();
@@ -485,6 +611,7 @@ fn serve(d: &Arc<Daemon>, conn: UnixStream) -> Result<()> {
         },
         "start" => d.start(),
         "stop" => d.stop("stop"),
+        "cancel" => d.cancel(),
         "status" => Ok(d.status()),
         "last" => Ok(d
             .last_bundle
@@ -571,4 +698,15 @@ fn spawn_daemon() -> Result<()> {
 
 pub fn bundle_dir_hint(p: &Path) -> String {
     p.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_key;
+
+    #[test]
+    fn shortcuts_read_like_keys() {
+        assert_eq!(pretty_key("ALT + SHIFT + R"), "Alt+Shift+R");
+        assert_eq!(pretty_key("SUPER+CTRL+x"), "Super+Ctrl+x");
+    }
 }

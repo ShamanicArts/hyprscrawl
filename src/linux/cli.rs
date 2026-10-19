@@ -12,10 +12,14 @@ const USAGE: &str = "Linux commands:
   scrawl toggle               start or finish a recording (bind this to a key)
   scrawl start | stop         explicit start / finish
   scrawl pick                 drag an area or click a window, then record it
+  scrawl cancel               stop the recording and keep nothing (Esc while recording)
   scrawl status               idle, recording or finishing
+  scrawl preview [latest|BUNDLE]
+                              open the review window (Alt+Shift+R, or click the “saved” notification)
   scrawl paste [BUNDLE]       paste the contact sheet + summary of the latest (or given) capture
   scrawl doctor               check what this machine has
-  scrawl hyprland-snippet     print a persistent bind for ~/.config/hypr/bindings.lua
+  scrawl hyprland-snippet     print persistent binds for ~/.config/hypr/bindings.lua
+  scrawl setup launcher       add “Scrawl” entries (record, review latest) to the app launcher
   scrawl setup transcription  download a whisper model (asks first)
   scrawl setup transcription chatgpt|local
                               transcribe with your ChatGPT login (Codex CLI), or locally only
@@ -41,6 +45,7 @@ pub fn intercept() -> Option<Result<()>> {
             Err(e) => Err(e),
         },
         "quit" => daemon::send("quit", false).map(|_| ()),
+        "cancel" => daemon::send("cancel", false).map(|r| println!("{r}")),
         "daemon" => daemon::run(args.iter().any(|a| a == "--record")),
         "paste" => paste(args.get(1).map(PathBuf::from)),
         "doctor" => doctor(),
@@ -49,8 +54,10 @@ pub fn intercept() -> Option<Result<()>> {
             println!("-- ~/.config/hypr/bindings.lua");
             println!("o.bind(\"{key}\", \"Scrawl: record / stop\", \"scrawl toggle\")");
             println!("o.bind(\"ALT + SHIFT + V\", \"Scrawl: paste latest\", \"scrawl paste\")");
+            println!("o.bind(\"ALT + SHIFT + R\", \"Scrawl: review latest\", \"scrawl preview latest\")");
             Ok(())
         }
+        "setup" if args.get(1).map(String::as_str) == Some("launcher") => setup_launcher(),
         "setup" if args.get(1).map(String::as_str) == Some("transcription") => match args.get(2).map(String::as_str) {
             Some("chatgpt") => setup_chatgpt(true),
             Some("local") => setup_chatgpt(false),
@@ -141,14 +148,37 @@ fn doctor() -> Result<()> {
     } else {
         println!("  transcription: local whisper.cpp (`scrawl setup transcription chatgpt` to use your ChatGPT login)");
     }
-    match daemon::hotkey() {
-        Some(k) => println!("  shortcut: {k} (runtime bind; `scrawl hyprland-snippet` for a permanent one)"),
-        None => println!("  shortcut: none"),
+    for (what, key) in [("record / stop", daemon::hotkey()), ("paste latest", daemon::paste_hotkey()), ("review latest", daemon::review_hotkey())] {
+        println!("  {what:<14} {}", key.map_or("off".into(), |k| daemon::pretty_key(&k)));
     }
+    println!("  (runtime binds added by the daemon; `scrawl hyprland-snippet` for permanent ones)");
     println!("  captures: {}", daemon::captures_dir().display());
     println!("  log:      {}", crate::capture::log_dir().join("scrawl.log").display());
     if bad > 0 {
         bail!("{bad} problem(s)");
+    }
+    Ok(())
+}
+
+/// Desktop entries, so the app launcher (Omarchy's Super+Space) finds "Scrawl: Review Latest
+/// Capture" and "Scrawl: Record".
+fn setup_launcher() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = dirs::data_dir().context("no data dir")?.join("applications");
+    std::fs::create_dir_all(&dir)?;
+    for (file, name, args, comment) in [
+        ("scrawl-review.desktop", "Scrawl: Review Latest Capture", "preview latest", "Open the latest Scrawl capture: contact sheet, keyframes, transcript"),
+        ("scrawl-record.desktop", "Scrawl: Record", "toggle", "Start or finish a Scrawl recording"),
+    ] {
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            format!(
+                "[Desktop Entry]\nType=Application\nName={name}\nComment={comment}\nExec=\"{}\" {args}\nIcon=camera-video\nTerminal=false\nCategories=Utility;\nKeywords=scrawl;capture;review;record;\n",
+                exe.display()
+            ),
+        )?;
+        println!("Added {}", path.display());
     }
     Ok(())
 }
