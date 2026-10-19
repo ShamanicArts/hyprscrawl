@@ -255,8 +255,23 @@ impl Daemon {
         if let Some(o) = a.overlay {
             o.stop();
         }
-        let recording = a.session.stop();
-        desktop::refresh_indicators();
+        // The audio goes out to be transcribed while the candidate frames decode.
+        let wav = a.bundle_dir.join("audio.wav");
+        let mut recorded_audio = None;
+        let recording = a.session.stop_with(|video, offset_ms| {
+            desktop::refresh_indicators();
+            recorded_audio = video.and_then(|v| {
+                gsr::extract_audio(v, &wav, offset_ms)
+                    .inspect_err(|e| scrawl_log(format!("audio extract: {e:#}")))
+                    .ok()?;
+                crate::audio::recorded_audio_from_wav(std::fs::read(&wav).ok()?).ok()
+            });
+            if recorded_audio.as_ref().is_some_and(|audio| audio.sample_count > 0)
+                && let Err(e) = crate::helper::prefetch(&wav)
+            {
+                scrawl_log(format!("transcription prefetch: {e:#}"));
+            }
+        });
         let mut activity = a.window_log.stop();
         activity.stop_started = Some(stop_started);
         activity.stop_ms = Some(stop_started.elapsed().as_millis() as u64);
@@ -275,13 +290,6 @@ impl Daemon {
             on_click: None,
             replaces: a.notice,
             critical: false,
-        });
-        let wav = a.bundle_dir.join("audio.wav");
-        let recorded_audio = recording.video.as_deref().and_then(|v| {
-            gsr::extract_audio(v, &wav, recording.video_offset_ms)
-                .inspect_err(|e| scrawl_log(format!("audio extract: {e:#}")))
-                .ok()?;
-            crate::audio::recorded_audio_from_wav(std::fs::read(&wav).ok()?).ok()
         });
         let (dir, bundle, summary) = crate::finalize_capture_bundle(
             &a.bundle_dir,

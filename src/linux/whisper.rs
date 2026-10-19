@@ -106,6 +106,11 @@ fn is_noise(text: &str) -> bool {
 }
 
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
+    transcribe_cancellable(audio, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// `transcribe`, killing whisper-cli as soon as `cancel` is set.
+pub fn transcribe_cancellable(audio: &Path, cancel: &std::sync::atomic::AtomicBool) -> Result<TranscriptData> {
     let cli = cli().context(
         "whisper-cli not found: install it with `omarchy-pkg-add whisper-cpp` (or set SCRAWL_WHISPER_CLI)",
     )?;
@@ -133,14 +138,25 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
         // DTW is silently skipped while flash attention is on (whisper.cpp's default).
         cmd.args(["-nfa", "--dtw", preset]);
     }
-    let status = cmd
+    // `nice` execs whisper-cli, so killing the child kills whisper.
+    let mut child = cmd
         .arg("-of")
         .arg(&of)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .with_context(|| format!("Could not run {}", cli.display()))?;
+    while child.try_wait()?.is_none() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            bail!("whisper-cli cancelled");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let status = child.wait_with_output()?;
     if !status.status.success() {
         let err = String::from_utf8_lossy(&status.stderr);
         let _ = std::fs::remove_dir_all(&tmp);

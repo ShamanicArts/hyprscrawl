@@ -398,7 +398,13 @@ impl ScreenCaptureSession {
         self.started_at.elapsed().as_millis() as u64
     }
 
-    pub fn stop(mut self) -> ScreenRecording {
+    pub fn stop(self) -> ScreenRecording {
+        self.stop_with(|_, _| {})
+    }
+
+    /// `stop`, running `video_saved(video, video_offset_ms)` as soon as the recorder has written
+    /// the file and before the candidate frames are decoded, so work can overlap the decode.
+    pub fn stop_with(mut self, video_saved: impl FnOnce(Option<&Path>, u64)) -> ScreenRecording {
         let duration_ms = self.elapsed_ms();
         let t0_us = instant_mono_us(self.started_at);
         let (video, first_frame_us) = match self.recorder.take() {
@@ -412,6 +418,7 @@ impl ScreenCaptureSession {
             None => (None, None),
         };
         let video_offset_ms = first_frame_us.map_or(0, |ff| ff.saturating_sub(t0_us) / 1_000);
+        video_saved(video.as_deref(), video_offset_ms);
         let frames = video
             .as_deref()
             .map(|v| candidates(v, video_offset_ms, duration_ms))

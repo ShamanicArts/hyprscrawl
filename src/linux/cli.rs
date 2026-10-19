@@ -57,8 +57,19 @@ pub fn intercept() -> Option<Result<()>> {
             _ => setup_transcription(),
         },
         "debug-transcribe" => match args.get(1) {
-            Some(wav) => crate::helper::transcribe(std::path::Path::new(wav))
-                .map(|t| println!("{}", serde_json::to_string_pretty(&t).unwrap_or_default())),
+            Some(wav) => {
+                // `--decode-ms N`: prefetch, then wait N ms as the frame decode would.
+                let wav = std::path::Path::new(wav);
+                if let Some(ms) = args.iter().position(|a| a == "--decode-ms").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()) {
+                    let _ = crate::helper::prefetch(wav);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                let started = std::time::Instant::now();
+                crate::helper::transcribe(wav).map(|t| {
+                    eprintln!("transcript ready {} ms after it was asked for", started.elapsed().as_millis());
+                    println!("{}", serde_json::to_string_pretty(&t).unwrap_or_default())
+                })
+            }
             None => Err(anyhow::anyhow!("usage: scrawl debug-transcribe <16 kHz wav>")),
         },
         "debug-events" => debug_events(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)),

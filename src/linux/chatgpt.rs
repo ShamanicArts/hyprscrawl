@@ -138,74 +138,147 @@ fn request(auth: &Auth, wav: &Path) -> Result<String> {
 }
 
 pub fn transcribe(wav: &Path) -> Result<TranscriptData> {
+    start(wav)?.finish(whisper_grace())
+}
+
+/// How long the transcript may wait for whisper's timings once ChatGPT's text is in hand and
+/// the transcript is wanted (`SCRAWL_WHISPER_GRACE_MS`, default 3 s). Past that, whisper is
+/// stopped and the words are spread as estimates.
+pub fn whisper_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("SCRAWL_WHISPER_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3_000),
+    )
+}
+
+type Whisper = (std::thread::JoinHandle<Result<TranscriptData>>, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+/// A transcription under way: ChatGPT's request and whisper (for timings) both running.
+pub struct Pending {
+    started: std::time::Instant,
+    /// ChatGPT's text and how long it took to arrive.
+    cloud: std::thread::JoinHandle<Result<(String, u128)>>,
+    whisper: Option<Whisper>,
+    islands: Vec<(u64, u64)>,
+    duration_ms: u64,
+}
+
+/// Starts ChatGPT and whisper on `wav` and returns at once.
+pub fn start(wav: &Path) -> Result<Pending> {
     let auth = auth()?;
     let started = std::time::Instant::now();
-    // Whisper runs at the same time; it only contributes word times.
-    let whisper = {
-        let wav = wav.to_owned();
-        let usable = crate::linux::whisper::cli().is_some() && crate::linux::whisper::model().is_some();
-        usable.then(|| std::thread::spawn(move || crate::linux::whisper::transcribe(&wav)))
-    };
     let bytes = std::fs::read(wav).context("Could not read the recording")?;
     let samples = crate::audio::decode_wav_16k(&bytes)?;
     let duration_ms = samples.len() as u64 / 16;
     let islands = crate::audio::speech_islands(&samples);
-
-    let text = if bytes.len() as u64 <= MAX_UPLOAD_BYTES {
-        request(&auth, wav)?
-    } else {
-        let mut clips = crate::hex::plan_clips(&islands, duration_ms);
-        if clips.is_empty() {
-            clips.push((0, duration_ms));
-        }
-        let dir = crate::linux::gsr::runtime_dir();
-        std::fs::create_dir_all(&dir)?;
-        let clip_path = dir.join(format!("chatgpt-clip-{}.wav", std::process::id()));
-        let result = crate::hex::transcribe_clips(&samples, &clips, MODEL, |clip| {
-            std::fs::write(&clip_path, clip).map_err(|e| crate::hex::Failure::Unavailable(e.to_string()))?;
-            request(&auth, &clip_path).map_err(|e| crate::hex::Failure::Unavailable(format!("{e:#}")))
-        });
-        let _ = std::fs::remove_file(&clip_path);
-        result?.text
-    };
-    let cloud_ms = started.elapsed().as_millis();
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let mut transcript = TranscriptData {
-        source: format!("chatgpt:{MODEL}"),
-        model: Some(MODEL.into()),
-        ..Default::default()
-    };
-    if text.is_empty() {
-        crate::capture::scrawl_log(format!("chatgpt {MODEL}: no speech in {cloud_ms} ms"));
-        return Ok(transcript);
-    }
-    let reference = whisper.and_then(|handle| match handle.join() {
-        Ok(Ok(data)) if !data.estimated && !data.words.is_empty() => Some(data.words),
-        Ok(Ok(_)) => None,
-        Ok(Err(error)) => {
-            crate::capture::scrawl_log(format!("whisper (timing only) failed: {error:#}"));
-            None
-        }
-        Err(_) => None,
+    let whisper = (crate::linux::whisper::cli().is_some() && crate::linux::whisper::model().is_some()).then(|| {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (wav, flag) = (wav.to_owned(), std::sync::Arc::clone(&cancel));
+        (std::thread::spawn(move || crate::linux::whisper::transcribe_cancellable(&wav, &flag)), cancel)
     });
-    let aligned = reference.as_deref().and_then(|words| align(&text, words));
-    transcript.words = match aligned {
-        Some(words) => words,
-        None => {
-            transcript.estimated = true;
-            spread_over_islands(&text, &islands, duration_ms)
-        }
+    let cloud = {
+        let (wav, islands) = (wav.to_owned(), islands.clone());
+        std::thread::spawn(move || -> Result<(String, u128)> {
+            if bytes.len() as u64 <= MAX_UPLOAD_BYTES {
+                return request(&auth, &wav).map(|text| (text, started.elapsed().as_millis()));
+            }
+            let mut clips = crate::hex::plan_clips(&islands, duration_ms);
+            if clips.is_empty() {
+                clips.push((0, duration_ms));
+            }
+            let dir = crate::linux::gsr::runtime_dir();
+            std::fs::create_dir_all(&dir)?;
+            let clip_path = dir.join(format!("chatgpt-clip-{}.wav", std::process::id()));
+            let result = crate::hex::transcribe_clips(&samples, &clips, MODEL, |clip| {
+                std::fs::write(&clip_path, clip).map_err(|e| crate::hex::Failure::Unavailable(e.to_string()))?;
+                request(&auth, &clip_path).map_err(|e| crate::hex::Failure::Unavailable(format!("{e:#}")))
+            });
+            let _ = std::fs::remove_file(&clip_path);
+            Ok((result?.text, started.elapsed().as_millis()))
+        })
     };
-    transcript.segments = segments_of(&transcript.words);
-    transcript.text = text;
-    crate::capture::scrawl_log(format!(
-        "chatgpt {MODEL}: {} words, cloud {cloud_ms} ms, total {} ms, times {}",
-        transcript.words.len(),
-        started.elapsed().as_millis(),
-        if transcript.estimated { "estimated" } else { "aligned to whisper" }
-    ));
-    Ok(transcript)
+    Ok(Pending {
+        started,
+        cloud,
+        whisper,
+        islands,
+        duration_ms,
+    })
+}
+
+impl Pending {
+    /// ChatGPT's text, timed by whisper if whisper is done within `grace` of the text.
+    pub fn finish(self, grace: std::time::Duration) -> Result<TranscriptData> {
+        let cancel_whisper = |whisper: Option<Whisper>| {
+            if let Some((handle, cancel)) = whisper {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = handle.join();
+            }
+        };
+        let (text, cloud_ms) = match self.cloud.join() {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(error)) => {
+                cancel_whisper(self.whisper);
+                return Err(error);
+            }
+            Err(_) => {
+                cancel_whisper(self.whisper);
+                bail!("ChatGPT request thread panicked");
+            }
+        };
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut transcript = TranscriptData {
+            source: format!("chatgpt:{MODEL}"),
+            model: Some(MODEL.into()),
+            ..Default::default()
+        };
+        if text.is_empty() {
+            cancel_whisper(self.whisper);
+            crate::capture::scrawl_log(format!("chatgpt {MODEL}: no speech in {cloud_ms} ms"));
+            return Ok(transcript);
+        }
+        let deadline = std::time::Instant::now() + grace;
+        let mut late = false;
+        let reference = self.whisper.and_then(|(handle, cancel)| {
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if !handle.is_finished() {
+                late = true;
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            match handle.join() {
+                Ok(Ok(data)) if !data.estimated && !data.words.is_empty() => Some(data.words),
+                Ok(Err(error)) if !late => {
+                    crate::capture::scrawl_log(format!("whisper (timing only) failed: {error:#}"));
+                    None
+                }
+                _ => None,
+            }
+        });
+        let aligned = reference.as_deref().and_then(|words| align(&text, words));
+        transcript.words = match aligned {
+            Some(words) => words,
+            None => {
+                transcript.estimated = true;
+                spread_over_islands(&text, &self.islands, self.duration_ms)
+            }
+        };
+        transcript.segments = segments_of(&transcript.words);
+        transcript.text = text;
+        crate::capture::scrawl_log(format!(
+            "chatgpt {MODEL}: {} words, cloud {cloud_ms} ms, total {} ms, times {}",
+            transcript.words.len(),
+            self.started.elapsed().as_millis(),
+            if !transcript.estimated {
+                "aligned to whisper"
+            } else if late {
+                "estimated (whisper too slow, stopped)"
+            } else {
+                "estimated"
+            }
+        ));
+        Ok(transcript)
+    }
 }
 
 fn norm(word: &str) -> String {

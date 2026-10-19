@@ -95,11 +95,23 @@ fn nice_args() -> Vec<String> {
     vec!["-n".into(), "10".into()]
 }
 
-/// whisper.cpp transcription with token-level timings merged into words. Fills the default
-/// (upstream: Apple SpeechAnalyzer) engine slot, so `transcribe.rs` is unchanged.
-/// Fills upstream's default engine slot: ChatGPT when chosen (`"transcriber": "chatgpt"`), with
-/// whisper.cpp as its timing source and its fallback; otherwise whisper.cpp alone.
+/// Fills upstream's default (Apple SpeechAnalyzer) engine slot, so `transcribe.rs` is unchanged:
+/// ChatGPT when chosen (`"transcriber": "chatgpt"`), with whisper.cpp as its timing source and its
+/// fallback; otherwise whisper.cpp alone. A transcription `prefetch`ed for this file is used.
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
+    let prefetched = PREFETCH.lock().unwrap().take_if(|p| p.wav == audio);
+    if let Some(prefetched) = prefetched {
+        let result = match prefetched.job {
+            Job::Cloud(pending) => pending.finish(crate::linux::chatgpt::whisper_grace()),
+            Job::Local(handle) => handle.join().unwrap_or_else(|_| Err(anyhow::anyhow!("whisper thread panicked"))),
+        };
+        let _ = std::fs::remove_file(&prefetched.copy);
+        match result {
+            Ok(transcript) => return Ok(transcript),
+            Err(error) => crate::capture::scrawl_log(format!("prefetched transcription failed, using whisper.cpp: {error:#}")),
+        }
+        return crate::linux::whisper::transcribe(audio);
+    }
     if crate::linux::chatgpt::enabled() {
         match crate::linux::chatgpt::transcribe(audio) {
             Ok(transcript) => return Ok(transcript),
@@ -109,6 +121,50 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     crate::linux::whisper::transcribe(audio)
 }
 
+enum Job {
+    Cloud(crate::linux::chatgpt::Pending),
+    Local(std::thread::JoinHandle<Result<TranscriptData>>),
+}
+
+struct Prefetch {
+    /// The path `transcribe` will be asked about.
+    wav: PathBuf,
+    /// What the job actually reads: upstream rewrites `wav` while finishing the bundle.
+    copy: PathBuf,
+    job: Job,
+}
+
+static PREFETCH: std::sync::Mutex<Option<Prefetch>> = std::sync::Mutex::new(None);
+
+/// Starts transcribing `wav` now, so it runs while the candidate frames decode; the bundle's
+/// later `transcribe(wav)` picks up the result.
+pub fn prefetch(wav: &Path) -> Result<()> {
+    let dir = crate::linux::gsr::runtime_dir();
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join(format!("prefetch-{}.wav", crate::make_bundle_id()));
+    std::fs::copy(wav, &copy)?;
+    let local = |copy: PathBuf| Job::Local(std::thread::spawn(move || crate::linux::whisper::transcribe(&copy)));
+    let job = if crate::linux::chatgpt::enabled() {
+        match crate::linux::chatgpt::start(&copy) {
+            Ok(pending) => Job::Cloud(pending),
+            Err(error) => {
+                crate::capture::scrawl_log(format!("ChatGPT transcription unavailable, using whisper.cpp: {error:#}"));
+                local(copy.clone())
+            }
+        }
+    } else {
+        local(copy.clone())
+    };
+    let old = PREFETCH.lock().unwrap().replace(Prefetch {
+        wav: wav.to_owned(),
+        copy,
+        job,
+    });
+    if let Some(old) = old {
+        let _ = std::fs::remove_file(old.copy);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
