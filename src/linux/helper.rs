@@ -305,10 +305,6 @@ fn decode_one(movie: &Path, pre_input: &[String], vf: &str, w: u32, h: u32) -> R
     decode(movie, pre_input, vf, &["-frames:v", "1"], w, h)
 }
 
-fn decode_raw(movie: &Path, pre_input: &[String], vf: &str, w: u32, h: u32) -> Result<Vec<Vec<u8>>> {
-    decode(movie, pre_input, vf, &[], w, h)
-}
-
 fn decode(
     movie: &Path,
     pre_input: &[String],
@@ -330,6 +326,96 @@ fn decode(
     Ok(raw.chunks_exact(size).map(<[u8]>::to_vec).collect())
 }
 
+/// The nearest frame every `ms`, stamped with its time, handed to `each` as ffmpeg decodes it:
+/// only one frame is in flight, so the caller decides what stays in memory (a long capture's
+/// candidates would otherwise be held twice, raw and split, before any thinning).
+pub fn frames_every(movie: &Path, ms: u64, max_edge: u32, mut each: impl FnMut(RgbaFrame)) -> Result<()> {
+    let p = probe(movie)?;
+    ensure!(p.width > 0 && p.height > 0, "No video stream in {}", movie.display());
+    let (w, h) = fit(p.width, p.height, max_edge);
+    let ms = ms.max(1);
+    // fps=1000/ms samples the frame nearest each multiple of `ms` from the start.
+    let vf = format!("fps=fps=1000/{ms}:round=near,scale={w}:{h}:flags=area");
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(movie)
+        .args(["-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Could not start ffmpeg (is it installed?)")?;
+    let mut stdout = child.stdout.take().context("no stdout")?;
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        let _ = stderr.read_to_string(&mut err);
+        err
+    });
+    // The same limit as the other decodes: past it ffmpeg is killed, which ends the reads.
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let finished = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let watchdog = {
+        let (child, finished) = (std::sync::Arc::clone(&child), std::sync::Arc::clone(&finished));
+        std::thread::spawn(move || {
+            let (done, cv) = &*finished;
+            let (done, timeout) = cv
+                .wait_timeout_while(done.lock().unwrap(), Duration::from_secs(300), |done| !*done)
+                .unwrap();
+            if !*done && timeout.timed_out() {
+                let _ = child.lock().unwrap().kill();
+                return true;
+            }
+            false
+        })
+    };
+    let size = w as usize * h as usize * 4;
+    let mut i = 0_u64;
+    loop {
+        let mut rgba = vec![0_u8; size];
+        if !read_full(&mut stdout, &mut rgba) {
+            break;
+        }
+        each(RgbaFrame::new((i * ms).min(p.duration_ms), w, h, rgba));
+        i += 1;
+    }
+    drop(stdout);
+    // Polled, letting go of the lock in between: ffmpeg can close stdout and still hang, and
+    // the watchdog needs the lock to kill it.
+    let status = loop {
+        match child.lock().unwrap().try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    *finished.0.lock().unwrap() = true;
+    finished.1.notify_all();
+    let timed_out = watchdog.join().unwrap_or(false);
+    let err = err_reader.join().unwrap_or_default();
+    ensure!(!timed_out, "ffmpeg timed out");
+    if !status?.success() {
+        let tail: Vec<&str> = err.lines().rev().take(6).collect();
+        bail!("ffmpeg failed: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" | "));
+    }
+    Ok(())
+}
+
+/// Fills `buf` from `r`; false at the end of the stream (a partial last frame is dropped).
+fn read_full(r: &mut impl Read, buf: &mut [u8]) -> bool {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Decodes movie frames into memory; `max_edge` 0 keeps native size.
 pub fn frames(movie: &Path, times: FrameTimes, max_edge: u32) -> Result<Vec<RgbaFrame>> {
     let p = probe(movie)?;
@@ -338,15 +424,9 @@ pub fn frames(movie: &Path, times: FrameTimes, max_edge: u32) -> Result<Vec<Rgba
     let scale = format!("scale={w}:{h}:flags=area");
     match times {
         FrameTimes::Every(ms) => {
-            let ms = ms.max(1);
-            // fps=1000/ms samples the frame nearest each multiple of `ms` from the start.
-            let vf = format!("fps=fps=1000/{ms}:round=near,{scale}");
-            let raws = decode_raw(movie, &[], &vf, w, h)?;
-            Ok(raws
-                .into_iter()
-                .enumerate()
-                .map(|(i, rgba)| RgbaFrame::new((i as u64 * ms).min(p.duration_ms), w, h, rgba))
-                .collect())
+            let mut frames = Vec::new();
+            frames_every(movie, ms, max_edge, |f| frames.push(f))?;
+            Ok(frames)
         }
         FrameTimes::At(times) => {
             if times.is_empty() {
