@@ -10,7 +10,7 @@ Setup needs no root, no `input` group, no Hyprland plugin and no edits to your c
 | | |
 |---|---|
 | **Alt+Shift+S** (tap) | Record the screen under the pointer. A red edge glow flashes as the start cue. Tap again to finish. |
-| **Alt+Shift+S** (hold) | Pick what to record: drag an area, or click a window. Esc cancels. |
+| **Alt+Shift+S** (hold) | Pick what to record: drag an area, or click a window. Esc cancels. A clicked window is recorded as the screen area it covered when you picked it: if you move it or cover it, the recording shows whatever is in that area. |
 | **Hold Shift + move** | Draw red ink while recording. A stroke fades from the screen 1.3 s after you let go (the bundle keeps it). Clicks still go to your apps. |
 | **Ctrl+Z** | Undo the last stroke while recording. |
 | **Esc** | Cancel the recording; nothing is saved. Esc is only taken while recording. |
@@ -107,6 +107,8 @@ binary is used first.
 - The capsule ("island") with its mode switcher and Paste / Inspect chips: notifications and the
   shortcuts above stand in for it.
 - Sending dev-site captures to their OpenCode session.
+- Recording one window by itself, following it as it moves and leaving out what covers it. Picking a
+  window records its area of the screen (see above).
 
 ## Following upstream
 
