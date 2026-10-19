@@ -18,7 +18,8 @@ fn data_dir() -> PathBuf {
 
 pub fn cli() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SCRAWL_WHISPER_CLI") {
-        return Some(PathBuf::from(p));
+        // An override is final: a wrong path means "none", not "look elsewhere".
+        return Some(PathBuf::from(p)).filter(|p| p.is_file());
     }
     if let Some(beside) = std::env::current_exe()
         .ok()
@@ -64,7 +65,8 @@ fn bins_in(dir: &Path, prefix: &str) -> Vec<PathBuf> {
 
 pub fn model() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SCRAWL_WHISPER_MODEL") {
-        return Some(PathBuf::from(p));
+        // An override is final: a wrong path means "none", not "look elsewhere".
+        return Some(PathBuf::from(p)).filter(|p| p.is_file());
     }
     let home = dirs::home_dir()?;
     bins_in(&data_dir().join("models"), "")

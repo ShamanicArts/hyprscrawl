@@ -2,6 +2,7 @@
 //! files are wired in from `main.rs` with `#[cfg_attr(target_os = "linux", path = …)]`;
 //! everything else Linux-specific lives here.
 
+pub mod chatgpt;
 pub mod cli;
 pub mod daemon;
 pub mod desktop;

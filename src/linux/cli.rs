@@ -17,6 +17,8 @@ const USAGE: &str = "Linux commands:
   scrawl doctor               check what this machine has
   scrawl hyprland-snippet     print a persistent bind for ~/.config/hypr/bindings.lua
   scrawl setup transcription  download a whisper model (asks first)
+  scrawl setup transcription chatgpt|local
+                              transcribe with your ChatGPT login (Codex CLI), or locally only
   scrawl daemon               run the background daemon in the foreground
   scrawl quit                 stop the daemon";
 
@@ -49,7 +51,16 @@ pub fn intercept() -> Option<Result<()>> {
             println!("o.bind(\"ALT + SHIFT + V\", \"Scrawl: paste latest\", \"scrawl paste\")");
             Ok(())
         }
-        "setup" if args.get(1).map(String::as_str) == Some("transcription") => setup_transcription(),
+        "setup" if args.get(1).map(String::as_str) == Some("transcription") => match args.get(2).map(String::as_str) {
+            Some("chatgpt") => setup_chatgpt(true),
+            Some("local") => setup_chatgpt(false),
+            _ => setup_transcription(),
+        },
+        "debug-transcribe" => match args.get(1) {
+            Some(wav) => crate::helper::transcribe(std::path::Path::new(wav))
+                .map(|t| println!("{}", serde_json::to_string_pretty(&t).unwrap_or_default())),
+            None => Err(anyhow::anyhow!("usage: scrawl debug-transcribe <16 kHz wav>")),
+        },
         "debug-events" => debug_events(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)),
         "debug-overlay" => debug_overlay(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4)),
         "help-linux" => {
@@ -113,6 +124,12 @@ fn doctor() -> Result<()> {
     row(cli.is_some(), "whisper-cli", cli.map_or("missing: omarchy-pkg-add whisper-cpp (or set SCRAWL_WHISPER_CLI)".into(), |p| p.display().to_string()));
     let model = whisper::model();
     row(model.is_some(), "whisper model", model.map_or("missing: scrawl setup transcription".into(), |p| p.display().to_string()));
+    if crate::linux::chatgpt::enabled() {
+        let login = crate::linux::chatgpt::status();
+        row(login.is_ok(), "ChatGPT transcription", login.map_or_else(|e| format!("{e:#}"), |()| format!("on ({})", crate::linux::chatgpt::auth_path().display())));
+    } else {
+        println!("  transcription: local whisper.cpp (`scrawl setup transcription chatgpt` to use your ChatGPT login)");
+    }
     match daemon::hotkey() {
         Some(k) => println!("  shortcut: {k} (runtime bind; `scrawl hyprland-snippet` for a permanent one)"),
         None => println!("  shortcut: none"),
@@ -122,6 +139,22 @@ fn doctor() -> Result<()> {
     if bad > 0 {
         bail!("{bad} problem(s)");
     }
+    Ok(())
+}
+
+/// Chooses ChatGPT transcription (after checking the Codex login) or local only, in the config.
+fn setup_chatgpt(on: bool) -> Result<()> {
+    let path = crate::handoff::default_config_path();
+    if on {
+        crate::linux::chatgpt::status()?;
+        crate::handoff::set_config_value_in(&path, "transcriber", "chatgpt".into())?;
+        println!("Recordings are now transcribed by ChatGPT ({}), signed in through {}.", crate::linux::chatgpt::MODEL, crate::linux::chatgpt::auth_path().display());
+        println!("The audio is uploaded to OpenAI. Local whisper.cpp, when installed, still supplies word timings and is the fallback.");
+    } else {
+        crate::handoff::set_config_value_in(&path, "transcriber", "apple".into())?;
+        println!("Recordings are transcribed locally with whisper.cpp.");
+    }
+    println!("Saved in {}", path.display());
     Ok(())
 }
 

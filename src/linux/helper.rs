@@ -97,7 +97,15 @@ fn nice_args() -> Vec<String> {
 
 /// whisper.cpp transcription with token-level timings merged into words. Fills the default
 /// (upstream: Apple SpeechAnalyzer) engine slot, so `transcribe.rs` is unchanged.
+/// Fills upstream's default engine slot: ChatGPT when chosen (`"transcriber": "chatgpt"`), with
+/// whisper.cpp as its timing source and its fallback; otherwise whisper.cpp alone.
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
+    if crate::linux::chatgpt::enabled() {
+        match crate::linux::chatgpt::transcribe(audio) {
+            Ok(transcript) => return Ok(transcript),
+            Err(error) => crate::capture::scrawl_log(format!("ChatGPT transcription failed, using whisper.cpp: {error:#}")),
+        }
+    }
     crate::linux::whisper::transcribe(audio)
 }
 
