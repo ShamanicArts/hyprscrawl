@@ -1,0 +1,26 @@
+extent 2536 1351
+# wheel spacing test: 400ms apart
+move 500 500
+wheel 1
+sleep 400
+wheel -1
+sleep 400
+wheel 0 1
+sleep 400
+# SUPER (125) + left drag
+key 125 1
+mods 64
+sleep 50
+move 300 300
+sleep 50
+down 272
+sleep 50
+move 400 350
+sleep 30
+move 500 400
+sleep 50
+up 272
+sleep 50
+key 125 0
+mods 0
+sleep 300

@@ -1,0 +1,54 @@
+extent 2536 1351
+move 400 300
+sleep 300
+down 272
+sleep 80
+up 272
+sleep 300
+move 800 500
+sleep 100
+down 272
+sleep 50
+move 850 520
+sleep 30
+move 900 540
+sleep 30
+move 1000 600
+sleep 50
+up 272
+sleep 300
+wheel 1
+sleep 100
+wheel -1
+sleep 300
+key 29 1
+mods 4
+sleep 50
+key 44 1
+sleep 50
+key 44 0
+mods 0
+key 29 0
+sleep 300
+key 42 1
+mods 1
+sleep 50
+move 1200 300
+sleep 30
+move 1250 330
+sleep 30
+move 1300 360
+sleep 50
+down 272
+sleep 60
+up 272
+sleep 50
+key 42 0
+mods 0
+sleep 300
+move 600 700
+sleep 100
+down 273
+sleep 60
+up 273
+sleep 500
