@@ -329,7 +329,15 @@ fn decode(
 /// The nearest frame every `ms`, stamped with its time, handed to `each` as ffmpeg decodes it:
 /// only one frame is in flight, so the caller decides what stays in memory (a long capture's
 /// candidates would otherwise be held twice, raw and split, before any thinning).
-pub fn frames_every(movie: &Path, ms: u64, max_edge: u32, mut each: impl FnMut(RgbaFrame)) -> Result<()> {
+/// `until_ms` (movie time) stops reading the movie there, before the sampling: nothing later can
+/// be picked as the nearest frame.
+pub fn frames_every(
+    movie: &Path,
+    ms: u64,
+    max_edge: u32,
+    until_ms: Option<u64>,
+    mut each: impl FnMut(RgbaFrame),
+) -> Result<()> {
     let p = probe(movie)?;
     ensure!(p.width > 0 && p.height > 0, "No video stream in {}", movie.display());
     let (w, h) = fit(p.width, p.height, max_edge);
@@ -337,7 +345,9 @@ pub fn frames_every(movie: &Path, ms: u64, max_edge: u32, mut each: impl FnMut(R
     // fps=1000/ms samples the frame nearest each multiple of `ms` from the start.
     let vf = format!("fps=fps=1000/{ms}:round=near,scale={w}:{h}:flags=area");
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+        .args(["-v", "error", "-nostdin"])
+        .args(until_ms.map(|t| ["-t".to_string(), format!("{:.3}", t as f64 / 1000.0)]).into_iter().flatten())
+        .arg("-i")
         .arg(movie)
         .args(["-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdin(Stdio::null())
@@ -425,7 +435,7 @@ pub fn frames(movie: &Path, times: FrameTimes, max_edge: u32) -> Result<Vec<Rgba
     match times {
         FrameTimes::Every(ms) => {
             let mut frames = Vec::new();
-            frames_every(movie, ms, max_edge, |f| frames.push(f))?;
+            frames_every(movie, ms, max_edge, None, |f| frames.push(f))?;
             Ok(frames)
         }
         FrameTimes::At(times) => {

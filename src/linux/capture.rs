@@ -360,6 +360,9 @@ pub struct ScreenCaptureSession {
     recorder: Option<crate::linux::gsr::Recorder>,
     video: Option<PathBuf>,
     _recording: crate::retention::Recording,
+    /// When the stop was asked for: the capture ends there, not when the recorder let go of the
+    /// file (the tail holds the stop flash).
+    ended_ms: Option<u64>,
 }
 
 impl ScreenCaptureSession {
@@ -383,6 +386,7 @@ impl ScreenCaptureSession {
             recorder,
             video: video_output_path,
             _recording: crate::retention::Recording::start(),
+            ended_ms: None,
         }
     }
 
@@ -398,6 +402,11 @@ impl ScreenCaptureSession {
         self.started_at.elapsed().as_millis() as u64
     }
 
+    /// Ends the capture's timeline now; the recorder is stopped later by `stop_with`.
+    pub fn mark_end(&mut self) {
+        self.ended_ms = Some(self.elapsed_ms());
+    }
+
     /// Stops the recorder and keeps nothing (a cancelled capture).
     pub fn discard(mut self) {
         if let Some(rec) = self.recorder.take()
@@ -408,13 +417,13 @@ impl ScreenCaptureSession {
     }
 
     pub fn stop(self) -> ScreenRecording {
-        self.stop_with(|_, _| {})
+        self.stop_with(|_, _, _| {})
     }
 
-    /// `stop`, running `video_saved(video, video_offset_ms)` as soon as the recorder has written
+    /// `stop`, running `video_saved(video, video_offset_ms, duration_ms)` as soon as the recorder has written
     /// the file and before the candidate frames are decoded, so work can overlap the decode.
-    pub fn stop_with(mut self, video_saved: impl FnOnce(Option<&Path>, u64)) -> ScreenRecording {
-        let duration_ms = self.elapsed_ms();
+    pub fn stop_with(mut self, video_saved: impl FnOnce(Option<&Path>, u64, u64)) -> ScreenRecording {
+        let duration_ms = self.ended_ms.unwrap_or_else(|| self.elapsed_ms());
         let t0_us = instant_mono_us(self.started_at);
         let (video, first_frame_us) = match self.recorder.take() {
             Some(rec) => match rec.stop() {
@@ -427,7 +436,7 @@ impl ScreenCaptureSession {
             None => (None, None),
         };
         let video_offset_ms = first_frame_us.map_or(0, |ff| ff.saturating_sub(t0_us) / 1_000);
-        video_saved(video.as_deref(), video_offset_ms);
+        video_saved(video.as_deref(), video_offset_ms, duration_ms);
         let frames = video
             .as_deref()
             .map(|v| candidates(v, video_offset_ms, duration_ms))
@@ -448,13 +457,33 @@ fn candidates(video: &Path, offset_ms: u64, duration_ms: u64) -> Vec<RgbaFrame> 
     let started = Instant::now();
     // Straight from ffmpeg into the buffer, which thins as it fills: memory stays within its budget.
     let mut buf = CandidateBuffer::new(CANDIDATE_BUDGET_BYTES);
-    let decoded = crate::helper::frames_every(video, interval, CANDIDATE_EDGE as u32, |mut f| {
+    // The movie runs on past the stop (the recorder finishing the file): read it only up to the end.
+    if offset_ms >= duration_ms {
+        // The recorder's first frame came after the stop: no picture from before it.
+        scrawl_log("candidates: none (the video starts after the stop)");
+        return Vec::new();
+    }
+    let until = duration_ms - offset_ms;
+    let decoded = crate::helper::frames_every(video, interval, CANDIDATE_EDGE as u32, Some(until), |mut f| {
         f.t_ms += offset_ms;
-        buf.push(f, false);
+        if f.t_ms <= duration_ms {
+            buf.push(f, false);
+        }
     });
     match decoded {
         Ok(()) => {
-            let frames = buf.into_frames();
+            let mut frames = buf.into_frames();
+            if frames.is_empty() {
+                // A stop right after the start leaves less movie than half a sampling step, and
+                // the sampler gives nothing: take the first frame there is, so the capture still
+                // has a picture.
+                let _ = crate::helper::frames_every(video, until, CANDIDATE_EDGE as u32, Some(until), |mut f| {
+                    f.t_ms += offset_ms;
+                    if frames.is_empty() && f.t_ms <= duration_ms {
+                        frames.push(f);
+                    }
+                });
+            }
             scrawl_log(format!(
                 "candidates: {} frames every {interval} ms in {} ms",
                 frames.len(),

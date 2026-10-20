@@ -219,13 +219,15 @@ fn ipc_stop(sock: &Path) -> Result<PathBuf> {
 }
 
 /// The mic track (first audio stream), mono 16 kHz, with `offset_ms` of leading silence so the
-/// WAV starts at bundle time 0 like upstream's `audio.wav`.
-pub fn extract_audio(video: &Path, wav: &Path, offset_ms: u64) -> Result<()> {
+/// WAV starts at bundle time 0 like upstream's `audio.wav`, cut at `end_ms` (bundle time): the
+/// recorder runs on a little past the stop.
+pub fn extract_audio(video: &Path, wav: &Path, offset_ms: u64, end_ms: u64) -> Result<()> {
+    let end = format!("{:.3}", end_ms as f64 / 1000.0);
     let af = format!("adelay=delays={offset_ms}:all=1,aresample=16000");
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-nostdin", "-i"])
         .arg(video)
-        .args(["-map", "0:a:0", "-ac", "1", "-af", &af, "-ar", "16000", "-c:a", "pcm_s16le"])
+        .args(["-map", "0:a:0", "-ac", "1", "-af", &af, "-ar", "16000", "-c:a", "pcm_s16le", "-t", &end])
         .arg(wav)
         .output()
         .context("Could not run ffmpeg")?;
