@@ -413,6 +413,11 @@ impl Daemon {
                 }
             }
         };
+        // Taken: the capture ends at this moment, and a green flash says so at once (the bundle
+        // still takes a few seconds to build).
+        let mut active = active;
+        active.session.mark_end();
+        crate::linux::overlay::Overlay::flash_stopped(&active.target);
         let result = self.finish(*active, reason);
         *self.state.lock().unwrap() = State::Idle;
         result
@@ -469,10 +474,10 @@ impl Daemon {
         // The audio goes out to be transcribed while the candidate frames decode.
         let wav = a.bundle_dir.join("audio.wav");
         let mut recorded_audio = None;
-        let recording = a.session.stop_with(|video, offset_ms| {
+        let recording = a.session.stop_with(|video, offset_ms, end_ms| {
             desktop::refresh_indicators();
             recorded_audio = video.and_then(|v| {
-                gsr::extract_audio(v, &wav, offset_ms)
+                gsr::extract_audio(v, &wav, offset_ms, end_ms)
                     .inspect_err(|e| scrawl_log(format!("audio extract: {e:#}")))
                     .ok()?;
                 crate::audio::recorded_audio_from_wav(std::fs::read(&wav).ok()?).ok()

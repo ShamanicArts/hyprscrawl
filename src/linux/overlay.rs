@@ -29,6 +29,7 @@ use crate::model::{Stroke, TargetInfo};
 use crate::sketch::{FreehandOptions, freehand_outline};
 
 const RED: [u8; 4] = [255, 59, 48, 255];
+const GREEN: [u8; 4] = [52, 199, 89, 255];
 const GLOW_MS: u64 = 900;
 
 pub struct Overlay {
@@ -38,6 +39,34 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn start(telemetry: Arc<SharedCaptureTelemetry>, target: &TargetInfo) -> Result<Self> {
+        Self::start_with(telemetry, target, RED, None)
+    }
+
+    /// The green edge flash that says a stop was taken, on its own surface (the recording's
+    /// overlay is going away). It runs out by itself.
+    pub fn flash_stopped(target: &TargetInfo) {
+        let (tx, _rx) = flume::unbounded();
+        let quiet = SharedCaptureTelemetry::new(tx);
+        let target = target.clone();
+        std::thread::spawn(move || {
+            if let Ok(o) = Self::start_with(quiet, &target, GREEN, Some(Duration::from_millis(GLOW_MS + 100))) {
+                o.wait();
+            }
+        });
+    }
+
+    fn wait(mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+
+    fn start_with(
+        telemetry: Arc<SharedCaptureTelemetry>,
+        target: &TargetInfo,
+        glow: [u8; 4],
+        life: Option<Duration>,
+    ) -> Result<Self> {
         if std::env::var_os("SCRAWL_NO_OVERLAY").is_some() {
             bail!("disabled by SCRAWL_NO_OVERLAY");
         }
@@ -62,7 +91,7 @@ impl Overlay {
         let thread = std::thread::Builder::new()
             .name("scrawl-overlay".into())
             .spawn(move || {
-                if let Err(e) = run(&telemetry, &target, &mon, &thread_stop, &ready_tx) {
+                if let Err(e) = run(&telemetry, &target, &mon, &thread_stop, &ready_tx, glow, life) {
                     scrawl_log(format!("overlay: {e:#}"));
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
@@ -233,6 +262,8 @@ fn run(
     mon: &crate::linux::hypr::Monitor,
     stop: &AtomicBool,
     ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    glow: [u8; 4],
+    life: Option<Duration>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("no Wayland display")?;
     let mut q = conn.new_event_queue();
@@ -351,7 +382,7 @@ fn run(
     let mut glow_done = false;
     let mut was_fading = false;
     let mut pixmap = tiny_skia::Pixmap::new(bw, bh).context("pixmap")?;
-    while !stop.load(Ordering::Acquire) && !st.closed {
+    while !stop.load(Ordering::Acquire) && !st.closed && life.is_none_or(|l| started.elapsed() < l) {
         pump(&conn, &mut q, &mut st)?;
         let generation = telemetry.ink_generation.load(Ordering::Acquire);
         let glow_t = started.elapsed().as_millis() as u64;
@@ -371,7 +402,7 @@ fn run(
             };
             pixmap.fill(tiny_skia::Color::TRANSPARENT);
             if glowing {
-                draw_glow(&mut pixmap, 1.0 - glow_t as f32 / GLOW_MS as f32, px_per_lp);
+                draw_glow(&mut pixmap, glow, 1.0 - glow_t as f32 / GLOW_MS as f32, px_per_lp);
             }
             for (s, alpha) in fading.iter().copied().chain(live.iter().map(|s| (s, 1.0))) {
                 draw_stroke(&mut pixmap, s, size, alpha, &to_px);
@@ -456,12 +487,12 @@ fn draw_stroke(pm: &mut tiny_skia::Pixmap, s: &Stroke, size: f32, alpha: f32, to
 }
 
 /// A red glow along the edges that fades out: "recording started".
-fn draw_glow(pm: &mut tiny_skia::Pixmap, strength: f32, scale: f32) {
+fn draw_glow(pm: &mut tiny_skia::Pixmap, color: [u8; 4], strength: f32, scale: f32) {
     let (w, h) = (pm.width() as f32, pm.height() as f32);
     let depth = 34.0 * scale;
     let a = (strength.clamp(0.0, 1.0) * 0.75 * 255.0) as u8;
-    let edge = tiny_skia::Color::from_rgba8(RED[0], RED[1], RED[2], a);
-    let clear = tiny_skia::Color::from_rgba8(RED[0], RED[1], RED[2], 0);
+    let edge = tiny_skia::Color::from_rgba8(color[0], color[1], color[2], a);
+    let clear = tiny_skia::Color::from_rgba8(color[0], color[1], color[2], 0);
     let rects = [
         (tiny_skia::Rect::from_xywh(0.0, 0.0, w, depth), (0.0, 0.0), (0.0, depth)),
         (tiny_skia::Rect::from_xywh(0.0, h - depth, w, depth), (0.0, h), (0.0, h - depth)),
